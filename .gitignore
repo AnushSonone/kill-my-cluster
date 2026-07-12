@@ -1,0 +1,15 @@
+# Compiled binaries
+/bin/
+*.exe
+
+# Go test artifacts
+*.test
+*.out
+coverage*
+
+# Local data directories (WAL + snapshots) — never commit runtime state
+/data/
+*.log
+
+# OS / editor cruft
+.DS_Store
