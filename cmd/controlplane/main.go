@@ -1,6 +1,8 @@
-// controlplane is the demo kill switch: whitelist stop/start of node containers.
+// controlplane is the demo kill switch: whitelist stop/start/partition + auto-heal.
 //
-//	CONTROL_NODES=1=kmc-node-1,2=kmc-node-2,3=kmc-node-3
+//	CONTROL_NODES=1=kmc-node-1,2=kmc-node-2,...
+//	CONTROL_NETWORK=kmc_kmc
+//	HEAL_AFTER=2s
 //	HTTP_ADDR=0.0.0.0:8080
 package main
 
@@ -15,14 +17,20 @@ import (
 )
 
 func main() {
-	nodes, err := parseNodes(env("CONTROL_NODES", "1=kmc-node-1,2=kmc-node-2,3=kmc-node-3"))
+	nodes, err := parseNodes(env("CONTROL_NODES", defaultNodes()))
 	if err != nil {
 		fatalf("%v", err)
 	}
+	healAfter, err := time.ParseDuration(env("HEAL_AFTER", "2s"))
+	if err != nil {
+		fatalf("HEAL_AFTER: %v", err)
+	}
 	eng, err := controlplane.NewEngine(controlplane.Config{
 		Nodes:             nodes,
+		Network:           env("CONTROL_NETWORK", "kmc_kmc"),
 		GlobalKillsPerSec: 1.5,
 		IPCooldown:        2 * time.Second,
+		HealAfter:         healAfter,
 	})
 	if err != nil {
 		fatalf("%v", err)
@@ -30,10 +38,19 @@ func main() {
 	defer eng.Close()
 
 	addr := env("HTTP_ADDR", "0.0.0.0:8080")
-	fmt.Printf("whitelist: %v\n", nodes)
+	fmt.Printf("whitelist: %d nodes · network=%s · heal=%s\n",
+		len(nodes), env("CONTROL_NETWORK", "kmc_kmc"), healAfter)
 	if err := controlplane.ListenAndServe(addr, eng); err != nil {
 		fatalf("%v", err)
 	}
+}
+
+func defaultNodes() string {
+	parts := make([]string, 0, 7)
+	for i := 1; i <= 7; i++ {
+		parts = append(parts, fmt.Sprintf("%d=kmc-node-%d", i, i))
+	}
+	return strings.Join(parts, ",")
 }
 
 func parseNodes(s string) ([]controlplane.Node, error) {

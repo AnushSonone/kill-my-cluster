@@ -23,6 +23,8 @@ func NewServer(eng *Engine) *Server {
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/api/nodes", s.handleList)
 	s.mux.HandleFunc("/api/nodes/", s.handleNodeAction)
+	s.mux.HandleFunc("/api/stream", s.handleStream)
+	s.mux.HandleFunc("/api/reset", s.handleReset)
 	return s
 }
 
@@ -43,12 +45,51 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	list, err := s.engine.List(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	writeJSON(w, s.engine.Snapshot(r.Context()))
+}
+
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, map[string]any{"nodes": list})
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			data, err := json.Marshal(s.engine.Snapshot(ctx))
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.engine.ResetAll(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "action": "reset"})
 }
 
 func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
@@ -56,11 +97,11 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// /api/nodes/{id}/{kill|restart}
+	// /api/nodes/{id}/{kill|restart|partition}
 	path := strings.TrimPrefix(r.URL.Path, "/api/nodes/")
 	parts := strings.Split(path, "/")
 	if len(parts) != 2 {
-		http.Error(w, "expected /api/nodes/{id}/{kill|restart}", http.StatusBadRequest)
+		http.Error(w, "expected /api/nodes/{id}/{kill|restart|partition}", http.StatusBadRequest)
 		return
 	}
 	id, err := strconv.ParseUint(parts[0], 10, 64)
@@ -74,8 +115,10 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		action = ActionKill
 	case "restart":
 		action = ActionRestart
+	case "partition":
+		action = ActionPartition
 	default:
-		http.Error(w, "unknown action (want kill|restart)", http.StatusBadRequest)
+		http.Error(w, "unknown action (want kill|restart|partition)", http.StatusBadRequest)
 		return
 	}
 
@@ -88,7 +131,10 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), code)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "id": id, "action": action})
+	writeJSON(w, map[string]any{
+		"ok": true, "id": id, "action": action,
+		"healAfterMs": s.engine.HealAfter().Milliseconds(),
+	})
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {

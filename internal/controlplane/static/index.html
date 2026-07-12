@@ -7,7 +7,8 @@
   <style>
     :root {
       --bg: #0b0f14; --panel: #121a24; --border: #1e2d3d;
-      --text: #e8eef4; --muted: #7a8fa3; --red: #ff5c5c; --green: #3dd68c; --gold: #f0c14b;
+      --text: #e8eef4; --muted: #7a8fa3; --red: #ff5c5c; --green: #3dd68c;
+      --gold: #f0c14b; --purple: #b794f6;
     }
     * { box-sizing: border-box; }
     body {
@@ -16,64 +17,117 @@
       color: var(--text); min-height: 100vh; padding: 1.5rem;
     }
     h1 { margin: 0 0 0.35rem; font-size: 1.35rem; }
-    .sub { color: var(--muted); margin-bottom: 1.25rem; font-size: 0.9rem; }
-    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); max-width: 900px; }
-    .card {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-      padding: 1rem;
+    .sub { color: var(--muted); margin-bottom: 1rem; font-size: 0.9rem; }
+    .banner {
+      display: none; margin-bottom: 1rem; padding: 0.75rem 1rem;
+      border-radius: 8px; background: rgba(255,92,92,0.12);
+      border: 1px solid rgba(255,92,92,0.35); color: #ffb4b4; font-size: 0.9rem;
     }
-    .card.dead { opacity: 0.55; border-color: var(--red); }
-    .card.running { border-color: #2a4a3a; }
-    .title { font-weight: 600; margin-bottom: 0.35rem; }
-    .meta { font-size: 0.78rem; color: var(--muted); margin-bottom: 0.75rem; }
-    .badge {
-      display: inline-block; font-size: 0.7rem; text-transform: uppercase;
-      letter-spacing: 0.06em; padding: 0.15rem 0.4rem; border-radius: 4px;
-      background: #1a2634; margin-bottom: 0.75rem;
-    }
-    .badge.on { color: var(--green); }
-    .badge.off { color: var(--red); }
-    .actions { display: flex; gap: 0.4rem; }
-    button {
-      flex: 1; font: inherit; font-size: 0.8rem; padding: 0.45rem;
+    .banner.show { display: block; }
+    .toolbar { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .toolbar button {
+      font: inherit; font-size: 0.8rem; padding: 0.45rem 0.75rem;
       border-radius: 6px; border: 1px solid var(--border);
       background: #1a2634; color: var(--text); cursor: pointer;
     }
-    button:disabled { opacity: 0.35; cursor: not-allowed; }
-    button.kill { border-color: rgba(255,92,92,0.45); color: #ffb4b4; }
-    button.restart { border-color: rgba(61,214,140,0.4); color: var(--green); }
-    .toast { margin-top: 1rem; color: var(--muted); font-size: 0.85rem; min-height: 1.2em; }
+    .grid {
+      display: grid; gap: 0.85rem;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      max-width: 1100px;
+    }
+    .card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 0.85rem;
+    }
+    .card.dead { opacity: 0.55; border-color: var(--red); }
+    .card.part { border-color: var(--purple); }
+    .card.running { border-color: #2a4a3a; }
+    .title { font-weight: 600; margin-bottom: 0.25rem; }
+    .meta { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.5rem; }
+    .badge {
+      display: inline-block; font-size: 0.65rem; text-transform: uppercase;
+      letter-spacing: 0.06em; padding: 0.15rem 0.4rem; border-radius: 4px;
+      background: #1a2634; margin-bottom: 0.5rem;
+    }
+    .badge.on { color: var(--green); }
+    .badge.off { color: var(--red); }
+    .badge.part { color: var(--purple); }
+    .heal { font-size: 0.72rem; color: var(--gold); margin-bottom: 0.5rem; min-height: 1em; }
+    .actions { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+    .actions button {
+      flex: 1; min-width: 4.2rem; font: inherit; font-size: 0.72rem; padding: 0.4rem;
+      border-radius: 6px; border: 1px solid var(--border);
+      background: #1a2634; color: var(--text); cursor: pointer;
+    }
+    .actions button:disabled { opacity: 0.35; cursor: not-allowed; }
+    .kill { border-color: rgba(255,92,92,0.45) !important; color: #ffb4b4 !important; }
+    .restart { border-color: rgba(61,214,140,0.4) !important; color: var(--green) !important; }
+    .partition { border-color: rgba(183,148,246,0.45) !important; color: var(--purple) !important; }
+    .feed {
+      margin-top: 1.25rem; max-width: 1100px; max-height: 200px; overflow-y: auto;
+      font-size: 0.78rem; color: var(--muted);
+    }
+    .feed .ev { padding: 0.25rem 0; border-bottom: 1px solid rgba(30,45,61,0.5); }
+    .toast { margin-top: 0.75rem; color: var(--muted); font-size: 0.85rem; min-height: 1.2em; }
     a { color: var(--gold); }
   </style>
 </head>
 <body>
   <h1>Kill My Cluster — Control Plane</h1>
-  <p class="sub">Whitelist only: kill / restart node containers. Watch failover on <a href="http://localhost:3000" target="_blank">Grafana</a>.</p>
+  <p class="sub">Whitelist kill / partition / restart. Auto-heal ~2s. Watch <a href="http://localhost:3000" target="_blank">Grafana</a>.</p>
+  <div id="banner" class="banner"><strong>Quorum lost.</strong> Majority of nodes must be healthy — bank freezes rather than lie.</div>
+  <div class="toolbar">
+    <button type="button" id="reset">Reset all</button>
+    <span class="sub" id="stats" style="margin:0;align-self:center"></span>
+  </div>
   <div class="grid" id="nodes"></div>
   <div class="toast" id="toast"></div>
+  <div class="feed" id="feed"></div>
   <script>
     const root = document.getElementById('nodes');
     const toast = document.getElementById('toast');
+    const feed = document.getElementById('feed');
+    const banner = document.getElementById('banner');
+    const stats = document.getElementById('stats');
 
-    async function refresh() {
-      const res = await fetch('/api/nodes');
-      const data = await res.json();
+    function render(data) {
+      banner.classList.toggle('show', !data.quorum && data.alive >= 0);
+      stats.textContent = `alive ${data.alive}/${data.total} · quorum ${data.quorum ? 'yes' : 'NO'} · heal ${data.healAfterMs}ms`;
       root.innerHTML = '';
       for (const n of data.nodes || []) {
         const card = document.createElement('div');
-        card.className = 'card ' + (n.running ? 'running' : 'dead');
+        let cls = 'card ';
+        if (!n.running) cls += 'dead';
+        else if (n.partitioned) cls += 'part';
+        else cls += 'running';
+        card.className = cls;
+        let badge = n.running ? (n.partitioned ? 'partitioned' : n.status) : n.status;
+        let badgeCls = n.running ? (n.partitioned ? 'part' : 'on') : 'off';
+        let heal = n.healDueMs > 0 ? `healing (${n.healKind}) in ${(n.healDueMs/1000).toFixed(1)}s` : '';
         card.innerHTML = `
           <div class="title">Node ${n.id}</div>
           <div class="meta">${n.container}</div>
-          <span class="badge ${n.running ? 'on' : 'off'}">${n.status}</span>
+          <span class="badge ${badgeCls}">${badge}</span>
+          <div class="heal">${heal}</div>
           <div class="actions">
-            <button class="kill" ${n.running ? '' : 'disabled'}>Kill</button>
-            <button class="restart" ${n.running ? 'disabled' : ''}>Restart</button>
+            <button class="kill" ${n.running && !n.partitioned ? '' : 'disabled'}>Kill</button>
+            <button class="partition" ${n.running && !n.partitioned ? '' : 'disabled'}>Partition</button>
+            <button class="restart" ${!n.running || n.partitioned ? '' : 'disabled'}>Restart</button>
           </div>`;
         card.querySelector('.kill').onclick = () => act(n.id, 'kill');
+        card.querySelector('.partition').onclick = () => act(n.id, 'partition');
         card.querySelector('.restart').onclick = () => act(n.id, 'restart');
         root.appendChild(card);
       }
+      const evs = (data.events || []).slice().reverse();
+      feed.innerHTML = evs.map(e => {
+        const t = new Date(e.time).toLocaleTimeString();
+        return `<div class="ev"><strong>${e.kind}</strong> ${t} — ${escapeHtml(e.message)}</div>`;
+      }).join('');
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
 
     async function act(id, action) {
@@ -81,11 +135,18 @@
       const res = await fetch(`/api/nodes/${id}/${action}`, { method: 'POST' });
       const text = await res.text();
       toast.textContent = res.ok ? `ok — ${action} node ${id}` : text;
-      await refresh();
     }
 
-    refresh();
-    setInterval(refresh, 1500);
+    document.getElementById('reset').onclick = async () => {
+      toast.textContent = 'reset all…';
+      const res = await fetch('/api/reset', { method: 'POST' });
+      toast.textContent = res.ok ? 'ok — reset all' : await res.text();
+    };
+
+    const es = new EventSource('/api/stream');
+    es.onmessage = (ev) => {
+      try { render(JSON.parse(ev.data)); } catch (_) {}
+    };
   </script>
 </body>
 </html>

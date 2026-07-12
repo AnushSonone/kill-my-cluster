@@ -9,5 +9,9 @@ scrape_configs:
           - node1:9100
           - node2:9100
           - node3:9100
+          - node4:9100
+          - node5:9100
+          - node6:9100
+          - node7:9100
         labels:
           cluster: docker

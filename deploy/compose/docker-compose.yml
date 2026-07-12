@@ -1,13 +1,14 @@
-# 3-node local cluster + Prometheus + Grafana + control plane.
-# Kill via UI:  http://localhost:8080
-# Or API:       curl -X POST http://localhost:8080/api/nodes/1/kill
+# 7-node local demo cluster + Prometheus + Grafana + control plane.
+# Kill UI:   http://localhost:8080
+# Grafana:   http://localhost:3000  (admin/admin)
+# Prom:      http://localhost:9090
 #
-# Grafana: http://localhost:3000  (admin/admin)
-# Prom:    http://localhost:9090
+# Auto-heal: control plane restarts/rejoins nodes ~2s after kill/partition.
 
 name: kmc
 
 services:
+
   node1:
     build: ../..
     container_name: kmc-node-1
@@ -17,8 +18,8 @@ services:
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
       METRICS_ADDR: 0.0.0.0:9100
-      PEERS: 2=node2:7000,3=node3:7000
-      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000
+      PEERS: 2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000,6=node6:7000,7=node7:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
       RUN_AGENT: "true"
     volumes:
       - node1-data:/data
@@ -34,8 +35,8 @@ services:
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
       METRICS_ADDR: 0.0.0.0:9100
-      PEERS: 1=node1:7000,3=node3:7000
-      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000
+      PEERS: 1=node1:7000,3=node3:7000,4=node4:7000,5=node5:7000,6=node6:7000,7=node7:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
       RUN_AGENT: "false"
     volumes:
       - node2-data:/data
@@ -51,11 +52,79 @@ services:
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
       METRICS_ADDR: 0.0.0.0:9100
-      PEERS: 1=node1:7000,2=node2:7000
-      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000
+      PEERS: 1=node1:7000,2=node2:7000,4=node4:7000,5=node5:7000,6=node6:7000,7=node7:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
       RUN_AGENT: "false"
     volumes:
       - node3-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  node4:
+    build: ../..
+    container_name: kmc-node-4
+    environment:
+      NODE_ID: "4"
+      DATA_DIR: /data
+      RAFT_ADDR: 0.0.0.0:7000
+      KV_ADDR: 0.0.0.0:8000
+      METRICS_ADDR: 0.0.0.0:9100
+      PEERS: 1=node1:7000,2=node2:7000,3=node3:7000,5=node5:7000,6=node6:7000,7=node7:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
+      RUN_AGENT: "false"
+    volumes:
+      - node4-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  node5:
+    build: ../..
+    container_name: kmc-node-5
+    environment:
+      NODE_ID: "5"
+      DATA_DIR: /data
+      RAFT_ADDR: 0.0.0.0:7000
+      KV_ADDR: 0.0.0.0:8000
+      METRICS_ADDR: 0.0.0.0:9100
+      PEERS: 1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,6=node6:7000,7=node7:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
+      RUN_AGENT: "false"
+    volumes:
+      - node5-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  node6:
+    build: ../..
+    container_name: kmc-node-6
+    environment:
+      NODE_ID: "6"
+      DATA_DIR: /data
+      RAFT_ADDR: 0.0.0.0:7000
+      KV_ADDR: 0.0.0.0:8000
+      METRICS_ADDR: 0.0.0.0:9100
+      PEERS: 1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000,7=node7:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
+      RUN_AGENT: "false"
+    volumes:
+      - node6-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  node7:
+    build: ../..
+    container_name: kmc-node-7
+    environment:
+      NODE_ID: "7"
+      DATA_DIR: /data
+      RAFT_ADDR: 0.0.0.0:7000
+      KV_ADDR: 0.0.0.0:8000
+      METRICS_ADDR: 0.0.0.0:9100
+      PEERS: 1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000,6=node6:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
+      RUN_AGENT: "false"
+    volumes:
+      - node7-data:/data
     networks: [kmc]
     restart: unless-stopped
 
@@ -66,7 +135,9 @@ services:
     container_name: kmc-controlplane
     environment:
       HTTP_ADDR: 0.0.0.0:8080
-      CONTROL_NODES: 1=kmc-node-1,2=kmc-node-2,3=kmc-node-3
+      CONTROL_NODES: 1=kmc-node-1,2=kmc-node-2,3=kmc-node-3,4=kmc-node-4,5=kmc-node-5,6=kmc-node-6,7=kmc-node-7
+      CONTROL_NETWORK: kmc_kmc
+      HEAL_AFTER: 2s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
@@ -105,8 +176,13 @@ services:
 networks:
   kmc:
     driver: bridge
+    name: kmc_kmc
 
 volumes:
   node1-data:
   node2-data:
   node3-data:
+  node4-data:
+  node5-data:
+  node6-data:
+  node7-data:

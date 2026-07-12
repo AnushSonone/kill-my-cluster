@@ -68,11 +68,14 @@ cd deploy/compose
 docker compose up -d --build
 ```
 
-- **Control plane (kill UI):** http://localhost:8080  
-- Grafana: http://localhost:3000 (`admin` / `admin`) → **Kill My Cluster**  
+- **Control plane:** http://localhost:8080 — kill / partition / restart, **auto-heal ~2s**, Reset all, SSE live state  
+- Grafana: http://localhost:3000 (`admin` / `admin`)  
 - Prometheus: http://localhost:9090  
-- API: `curl -X POST http://localhost:8080/api/nodes/1/kill` then `.../restart`
+- **7-node** Raft group (quorum 4)
 
 ```bash
+curl -X POST http://localhost:8080/api/nodes/1/kill      # comes back ~2s
+curl -X POST http://localhost:8080/api/nodes/2/partition  # rejoins network ~2s
+curl -X POST http://localhost:8080/api/reset
 docker compose down
 ```
