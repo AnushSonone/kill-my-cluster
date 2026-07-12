@@ -39,9 +39,18 @@ type Cluster struct {
 	waitMu  sync.Mutex
 	waiters map[uint64]chan ApplyResult
 
+	// telemetry is optional; set via SetTelemetry for Prometheus.
+	telemetry Telemetry
+
 	stop     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+}
+
+// Telemetry is the optional metrics sink (implemented by internal/metrics).
+type Telemetry interface {
+	ObservePropose(d time.Duration)
+	IncApply()
 }
 
 // Config bundles what NewCluster needs. It mirrors raft.Config but owns the
@@ -79,6 +88,10 @@ func NewCluster(cfg Config) (*Cluster, error) {
 
 // Raft returns the underlying Raft node (for serving node-to-node RPCs).
 func (c *Cluster) Raft() *raft.Node { return c.raft }
+
+// SetTelemetry attaches a metrics sink (e.g. Prometheus collector). Safe to
+// call once after NewCluster, before serving traffic.
+func (c *Cluster) SetTelemetry(t Telemetry) { c.telemetry = t }
 
 // Stop shuts down the apply loop and the Raft node.
 func (c *Cluster) Stop() {
@@ -132,6 +145,9 @@ func (c *Cluster) handleApply(msg raft.ApplyMsg) {
 		panic(fmt.Sprintf("kv: decode at index %d: %v", msg.CommandIndex, err))
 	}
 	res := c.machine.Apply(cmd)
+	if c.telemetry != nil {
+		c.telemetry.IncApply()
+	}
 
 	c.waitMu.Lock()
 	if ch, ok := c.waiters[msg.CommandIndex]; ok {
@@ -146,6 +162,7 @@ func (c *Cluster) handleApply(msg raft.ApplyMsg) {
 // propose encodes cmd, sends it through Raft, and waits for local apply.
 func (c *Cluster) propose(ctx context.Context, cmd Command) (ApplyResult, error) {
 	data := Encode(cmd)
+	start := time.Now()
 
 	// Retry loop: followers redirect by returning ErrNotLeader.
 	for {
@@ -164,6 +181,9 @@ func (c *Cluster) propose(ctx context.Context, cmd Command) (ApplyResult, error)
 
 		select {
 		case res := <-ch:
+			if c.telemetry != nil {
+				c.telemetry.ObservePropose(time.Since(start))
+			}
 			return res, nil
 		case <-ctx.Done():
 			c.waitMu.Lock()
@@ -176,6 +196,7 @@ func (c *Cluster) propose(ctx context.Context, cmd Command) (ApplyResult, error)
 			c.waitMu.Lock()
 			delete(c.waiters, index)
 			c.waitMu.Unlock()
+			start = time.Now()
 		}
 	}
 }

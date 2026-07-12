@@ -245,6 +245,13 @@ func (n *Node) Status() (term uint64, isLeader bool) {
 	return n.currentTerm, n.role == Leader
 }
 
+// Role returns follower, candidate, or leader — used by metrics scrapers.
+func (n *Node) Role() Role {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.role
+}
+
 // LeaderID returns the last known leader's ID (0 if unknown). Clients use
 // this to redirect requests to the leader.
 func (n *Node) LeaderID() uint64 {
