@@ -1,0 +1,10 @@
+# Ignore build context noise (keeps `docker build` fast).
+.git
+**/*_test.go
+deploy/observability
+cmd/storagedemo
+cmd/raftdemo
+cmd/kvdemo
+cmd/bankdemo
+cmd/metricsdemo
+*.md

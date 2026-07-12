@@ -1,0 +1,97 @@
+# 3-node local cluster + Prometheus + Grafana.
+# Kill a node:  docker stop kmc-node-1
+# Restart it:   docker start kmc-node-1
+#
+# UI:  http://localhost:3000  (Grafana, admin/admin)
+# Prom: http://localhost:9090
+
+name: kmc
+
+services:
+  node1:
+    build: ../..
+    container_name: kmc-node-1
+    environment:
+      NODE_ID: "1"
+      DATA_DIR: /data
+      RAFT_ADDR: 0.0.0.0:7000
+      KV_ADDR: 0.0.0.0:8000
+      METRICS_ADDR: 0.0.0.0:9100
+      PEERS: 2=node2:7000,3=node3:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000
+      RUN_AGENT: "true"
+    volumes:
+      - node1-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  node2:
+    build: ../..
+    container_name: kmc-node-2
+    environment:
+      NODE_ID: "2"
+      DATA_DIR: /data
+      RAFT_ADDR: 0.0.0.0:7000
+      KV_ADDR: 0.0.0.0:8000
+      METRICS_ADDR: 0.0.0.0:9100
+      PEERS: 1=node1:7000,3=node3:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000
+      RUN_AGENT: "false"
+    volumes:
+      - node2-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  node3:
+    build: ../..
+    container_name: kmc-node-3
+    environment:
+      NODE_ID: "3"
+      DATA_DIR: /data
+      RAFT_ADDR: 0.0.0.0:7000
+      KV_ADDR: 0.0.0.0:8000
+      METRICS_ADDR: 0.0.0.0:9100
+      PEERS: 1=node1:7000,2=node2:7000
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000
+      RUN_AGENT: "false"
+    volumes:
+      - node3-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: kmc-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks: [kmc]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: kmc-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [kmc]
+    restart: unless-stopped
+
+networks:
+  kmc:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
