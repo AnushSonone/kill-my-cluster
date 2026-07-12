@@ -145,6 +145,19 @@ services:
     networks: [kmc]
     restart: unless-stopped
 
+  web:
+    build: ../../web
+    container_name: kmc-web
+    environment:
+      HOST: 0.0.0.0
+      PORT: "5173"
+      CONTROLPLANE_URL: http://controlplane:8080
+    ports:
+      - "5173:5173"
+    depends_on: [controlplane]
+    networks: [kmc]
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v3.2.1
     container_name: kmc-prometheus

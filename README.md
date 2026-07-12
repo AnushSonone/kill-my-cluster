@@ -13,8 +13,9 @@ Under active development, built in phases:
 - **Phase 3 — KV store + exactly-once semantics.** ← *done*
 - **Phase 4 — Bank tenant agent.** ← *done*
 - **Phase 5 — Observability (Prometheus + Grafana).** ← *done*
-- **Docker cluster** — `cmd/node` + Compose. ← *local*
-- Later — public demo, sharding, chaos testing.
+- **Docker cluster** — `cmd/node` + Compose (7 nodes). ← *done*
+- **Demo web UI** — SvelteKit SVG cluster graph. ← *local*
+- Later — game layer, public demo on Oracle, sharding, chaos testing.
 
 ## Layout
 
@@ -69,9 +70,17 @@ docker compose up -d --build
 ```
 
 - **Control plane:** http://localhost:8080 — kill / partition / restart, **auto-heal ~2s**, Reset all, SSE live state  
+- **Cluster graph UI:** http://localhost:5173 — SvelteKit SVG mesh (select a node → kill/partition)  
 - Grafana: http://localhost:3000 (`admin` / `admin`)  
 - Prometheus: http://localhost:9090  
 - **7-node** Raft group (quorum 4)
+
+Local frontend dev (hot reload):
+
+```bash
+cd web && npm install && npm run dev
+# proxies /api → http://127.0.0.1:8080
+```
 
 ```bash
 curl -X POST http://localhost:8080/api/nodes/1/kill      # comes back ~2s
