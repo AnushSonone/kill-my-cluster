@@ -1,0 +1,14 @@
+# Control plane image includes the docker CLI (argv-only stop/start) + our binary.
+# Mount /var/run/docker.sock at runtime.
+
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /kmc-controlplane ./cmd/controlplane
+
+FROM docker:27-cli
+COPY --from=build /kmc-controlplane /kmc-controlplane
+EXPOSE 8080
+ENTRYPOINT ["/kmc-controlplane"]

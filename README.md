@@ -63,17 +63,15 @@ go run ./cmd/metricsdemo
 
 ### Docker cluster (preferred)
 
-Stop host `metricsdemo` and `deploy/observability` first (ports 3000/9090 clash).
-
 ```bash
 cd deploy/compose
 docker compose up -d --build
 ```
 
-- Grafana: http://localhost:3000 (`admin` / `admin`) → **Kill My Cluster**
-- Prometheus: http://localhost:9090
-- **Kill a node:** `docker stop kmc-node-1` — watch the leader gauge flip
-- **Restart:** `docker start kmc-node-1` (or rely on `restart: unless-stopped`)
+- **Control plane (kill UI):** http://localhost:8080  
+- Grafana: http://localhost:3000 (`admin` / `admin`) → **Kill My Cluster**  
+- Prometheus: http://localhost:9090  
+- API: `curl -X POST http://localhost:8080/api/nodes/1/kill` then `.../restart`
 
 ```bash
 docker compose down

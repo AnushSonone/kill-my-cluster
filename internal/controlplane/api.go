@@ -1,0 +1,131 @@
+package controlplane
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Server exposes the whitelist HTTP API (+ optional tiny kill UI).
+type Server struct {
+	engine *Engine
+	mux    *http.ServeMux
+}
+
+// NewServer builds routes around eng.
+func NewServer(eng *Engine) *Server {
+	s := &Server{engine: eng, mux: http.NewServeMux()}
+	s.mux.HandleFunc("/", s.handleIndex)
+	s.mux.HandleFunc("/healthz", s.handleHealth)
+	s.mux.HandleFunc("/api/nodes", s.handleList)
+	s.mux.HandleFunc("/api/nodes/", s.handleNodeAction)
+	return s
+}
+
+// Handler returns the root handler.
+func (s *Server) Handler() http.Handler { return s.mux }
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	list, err := s.engine.List(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"nodes": list})
+}
+
+func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// /api/nodes/{id}/{kill|restart}
+	path := strings.TrimPrefix(r.URL.Path, "/api/nodes/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		http.Error(w, "expected /api/nodes/{id}/{kill|restart}", http.StatusBadRequest)
+		return
+	}
+	id, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil || id == 0 {
+		http.Error(w, "invalid node id", http.StatusBadRequest)
+		return
+	}
+	var action Action
+	switch parts[1] {
+	case "kill":
+		action = ActionKill
+	case "restart":
+		action = ActionRestart
+	default:
+		http.Error(w, "unknown action (want kill|restart)", http.StatusBadRequest)
+		return
+	}
+
+	ip := clientIP(r)
+	if err := s.engine.Do(r.Context(), ip, id, action); err != nil {
+		code := http.StatusBadRequest
+		if strings.Contains(err.Error(), "rate limit") || strings.Contains(err.Error(), "cooldown") {
+			code = http.StatusTooManyRequests
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "id": id, "action": action})
+}
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(indexHTML)
+}
+
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
+}
+
+// ListenAndServe is a convenience for cmd/controlplane.
+func ListenAndServe(addr string, eng *Engine) error {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           NewServer(eng).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	fmt.Printf("control plane listening on http://%s\n", addr)
+	return srv.ListenAndServe()
+}

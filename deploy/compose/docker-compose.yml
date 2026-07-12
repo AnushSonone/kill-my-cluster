@@ -1,9 +1,9 @@
-# 3-node local cluster + Prometheus + Grafana.
-# Kill a node:  docker stop kmc-node-1
-# Restart it:   docker start kmc-node-1
+# 3-node local cluster + Prometheus + Grafana + control plane.
+# Kill via UI:  http://localhost:8080
+# Or API:       curl -X POST http://localhost:8080/api/nodes/1/kill
 #
-# UI:  http://localhost:3000  (Grafana, admin/admin)
-# Prom: http://localhost:9090
+# Grafana: http://localhost:3000  (admin/admin)
+# Prom:    http://localhost:9090
 
 name: kmc
 
@@ -56,6 +56,21 @@ services:
       RUN_AGENT: "false"
     volumes:
       - node3-data:/data
+    networks: [kmc]
+    restart: unless-stopped
+
+  controlplane:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.controlplane
+    container_name: kmc-controlplane
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      CONTROL_NODES: 1=kmc-node-1,2=kmc-node-2,3=kmc-node-3
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
     networks: [kmc]
     restart: unless-stopped
 
