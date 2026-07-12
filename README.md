@@ -11,21 +11,20 @@ Under active development, built in phases:
   with recovery and snapshotting. ← *done*
 - **Phase 2 — Raft consensus (leader election, log replication, snapshots).** ← *done*
 - **Phase 3 — KV store + exactly-once semantics.** ← *done*
-- Later — public demo, observability (Phase 5), bank tenant (Phase 4), sharding, chaos testing.
+- **Phase 4 — Bank tenant agent.** ← *done*
+- Later — observability (Phase 5), public demo, sharding, chaos testing.
 
 ## Layout
 
 ```
 internal/storage/   Phase 1: write-ahead log + durable key-value store
-internal/raft/      Phase 2: Raft consensus (election, replication, persistence)
-internal/raftpb/    generated gRPC types for Raft node-to-node RPCs
-internal/kv/        Phase 3: replicated KV state machine + exactly-once + client API
-internal/kvpb/      generated gRPC types for client KV API
-proto/raft.proto    Raft wire protocol
-proto/kv.proto      Client KV API (Get/Put/CAS/ExecuteOnce/Checkpoint/Watch)
-cmd/storagedemo/    Phase 1 crash-recovery demo
-cmd/raftdemo/       Phase 2: 3-node Raft elect → kill leader → re-elect
-cmd/kvdemo/         Phase 3: linearizable KV + exactly-once retry demo
+internal/raft/      Phase 2: Raft consensus
+internal/kv/        Phase 3: replicated KV + exactly-once
+internal/bank/      Phase 4: bank tenant + naive twin
+cmd/storagedemo/    Phase 1 demo
+cmd/raftdemo/       Phase 2 demo
+cmd/kvdemo/         Phase 3 demo
+cmd/bankdemo/       Phase 4 demo — $1,000 conserved vs naive drift
 ```
 
 ## Requirements
@@ -57,4 +56,10 @@ Phase 3 — linearizable KV + exactly-once (retried request runs the mutation on
 
 ```bash
 go run ./cmd/kvdemo
+```
+
+Phase 4 — bank tenant ($1,000 conserved; naive twin leaks on duplicate credits):
+
+```bash
+go run ./cmd/bankdemo
 ```
