@@ -1,0 +1,115 @@
+// raft.proto defines the wire protocol Raft nodes use to talk to each other.
+//
+// Why Protocol Buffers + gRPC?
+//   - Protobuf gives us a compact, versionable, language-neutral binary
+//     encoding. Field numbers (the `= 1`, `= 2` tags) are the wire identity of
+//     each field, so we can add fields later without breaking old nodes.
+//   - gRPC gives us typed RPCs over HTTP/2 with multiplexing, deadlines and
+//     cancellation built in — exactly the request/response shape Raft needs.
+//
+// The three RPCs below are the *entire* node-to-node surface of Raft, straight
+// from the paper ("In Search of an Understandable Consensus Algorithm"):
+//   - RequestVote     — candidates ask peers for votes during elections.
+//   - AppendEntries   — the leader replicates log entries; empty ones double
+//                       as heartbeats ("I'm still alive, don't start an election").
+//   - InstallSnapshot — when a follower is so far behind that the leader has
+//                       already compacted away the log entries it needs, the
+//                       leader ships a full state snapshot instead.
+syntax = "proto3";
+
+package raftpb;
+
+option go_package = "github.com/AnushSonone/kill-my-cluster/internal/raftpb";
+
+// LogEntry is one command in the replicated log.
+//
+// The (term, index) pair uniquely identifies an entry across the whole
+// cluster: Raft's Log Matching property guarantees that if two logs contain an
+// entry with the same index and term, the logs are identical up through that
+// entry. Data is opaque bytes — Raft replicates commands without understanding
+// them; the state machine (Phase 3's KV store) gives them meaning.
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  bytes data = 3;
+}
+
+// RequestVote is sent by a candidate to gather votes (Raft §5.2).
+message RequestVoteRequest {
+  // The candidate's term. Terms are Raft's logical clock: every message
+  // carries one, and any node that sees a higher term than its own immediately
+  // adopts it and steps down to follower.
+  uint64 term = 1;
+  // Who is asking for the vote.
+  uint64 candidate_id = 2;
+  // The index and term of the candidate's last log entry. Voters use these to
+  // enforce the Election Restriction (§5.4.1): only grant a vote if the
+  // candidate's log is at least as up-to-date as the voter's. This is what
+  // guarantees a new leader already holds every committed entry.
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+  // The voter's current term, so a stale candidate can update itself.
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+// AppendEntries is sent by the leader to replicate entries and as a heartbeat
+// (Raft §5.3). An empty `entries` list is a pure heartbeat.
+message AppendEntriesRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  // The index/term of the entry immediately BEFORE the new ones. The follower
+  // must have a matching entry there or it rejects the append — this is the
+  // consistency check that makes logs converge (Log Matching property).
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  // The leader's commit index. Followers advance their own commit point to
+  // min(leader_commit, index of last new entry) — commitment flows from
+  // leader to followers via this field.
+  uint64 leader_commit = 6;
+}
+
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+  // Conflict hints (the "fast backup" optimization from the paper's §5.3
+  // discussion): when the consistency check fails, the follower reports the
+  // term of the conflicting entry and the first index it holds for that term.
+  // The leader can then skip its nextIndex back over an entire bad term in one
+  // round-trip instead of decrementing one entry at a time.
+  uint64 conflict_index = 3;
+  uint64 conflict_term = 4;
+}
+
+// InstallSnapshot ships a complete, compacted state image to a follower whose
+// log position predates the leader's earliest retained entry (Raft §7).
+//
+// We send the snapshot in a single message rather than the paper's chunked
+// offset/done protocol: our demo snapshots are small (a KV map), and gRPC
+// handles multi-megabyte messages fine. Chunking can be added later without
+// changing the semantics.
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  // The snapshot replaces ALL log entries up through this index/term. The
+  // follower's state machine jumps directly to this point.
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes data = 5;
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
+}
+
+// Raft is the node-to-node RPC service. Every node runs this server and dials
+// every peer as a client.
+service Raft {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}

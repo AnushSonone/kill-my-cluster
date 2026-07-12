@@ -186,6 +186,21 @@ func (w *WAL) Close() error {
 // If the file does not exist, there is simply nothing to replay: return (0, nil).
 // If fn returns an error, we stop and return (validOffset, thatError) so the
 // caller learns how far application succeeded before the failure.
+// ReplayWAL is the exported entry point to replayWAL, added in Phase 2 so the
+// Raft layer can reuse this exact framing/recovery machinery for its own log
+// (Raft state must survive crashes with the same guarantees as KV data, and
+// there is no reason to maintain two WAL implementations).
+func ReplayWAL(path string, fn func(payload []byte) error) (int64, error) {
+	return replayWAL(path, fn)
+}
+
+// SyncDir is the exported entry point to syncDir (see snapshot.go), for the
+// same Phase 2 reuse reason: the Raft layer performs its own atomic
+// write-temp-then-rename file swaps and needs to make those renames durable.
+func SyncDir(dir string) error {
+	return syncDir(dir)
+}
+
 func replayWAL(path string, fn func(payload []byte) error) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {

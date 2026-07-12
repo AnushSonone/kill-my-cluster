@@ -1,0 +1,104 @@
+// kv.proto is the client-facing API for the replicated KV store (Phase 3).
+//
+// Clients talk to any node; followers return NOT_LEADER with a hint so the
+// client can retry against the current leader. Every mutating RPC carries
+// client_id + request_id for exactly-once semantics enforced by the state machine.
+syntax = "proto3";
+
+package kvpb;
+
+option go_package = "github.com/AnushSonone/kill-my-cluster/internal/kvpb";
+
+message GetRequest {
+  string client_id = 1;
+  uint64 request_id = 2;
+  string key = 3;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+  bool duplicate = 3;
+  bool not_leader = 4;
+  uint64 leader_id = 5;
+}
+
+message PutRequest {
+  string client_id = 1;
+  uint64 request_id = 2;
+  string key = 3;
+  bytes value = 4;
+}
+
+message PutResponse {
+  bytes previous_value = 1;
+  bool duplicate = 2;
+  bool not_leader = 3;
+  uint64 leader_id = 4;
+}
+
+message CASRequest {
+  string client_id = 1;
+  uint64 request_id = 2;
+  string key = 3;
+  bytes expect = 4;
+  bytes value = 5;
+}
+
+message CASResponse {
+  bool swapped = 1;
+  bytes previous_value = 2;
+  bool duplicate = 3;
+  bool not_leader = 4;
+  uint64 leader_id = 5;
+}
+
+message ExecuteOnceRequest {
+  string client_id = 1;
+  uint64 request_id = 2;
+  string key = 3;
+  bytes value = 4;
+  // If true, use CAS with expect=previous_value (zero-length expect means absent key).
+  bool use_cas = 5;
+  bytes expect = 6;
+}
+
+message ExecuteOnceResponse {
+  bool ok = 1;
+  bytes value = 2;
+  bool duplicate = 3;
+  bool not_leader = 4;
+  uint64 leader_id = 5;
+}
+
+message CheckpointRequest {
+  string client_id = 1;
+  uint64 request_id = 2;
+  bytes state = 3;
+}
+
+message CheckpointResponse {
+  bool ok = 1;
+  bool duplicate = 2;
+  bool not_leader = 3;
+  uint64 leader_id = 4;
+}
+
+message WatchRequest {
+  string key = 1;
+}
+
+message WatchResponse {
+  string key = 1;
+  bytes value = 2;
+  bool found = 3;
+}
+
+service KV {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc CAS(CASRequest) returns (CASResponse);
+  rpc ExecuteOnce(ExecuteOnceRequest) returns (ExecuteOnceResponse);
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+}
