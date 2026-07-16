@@ -2,8 +2,15 @@
 # Kill UI:   http://localhost:8080
 # Grafana:   http://localhost:3000  (admin/admin)
 # Prom:      http://localhost:9090
+# Graph UI:  http://localhost:5173  (Threlte/Three.js client-side; SVG fallback)
 #
-# Auto-heal: control plane restarts/rejoins nodes ~2s after kill/partition.
+# Auto-heal: control plane restarts/rejoins machines ~10s after kill/partition.
+#
+# Oracle Always Free (Ampere A1 ~2 OCPU / 12 GB): 3D mesh is browser-only — do not
+# add server-side WebGL. Budget RAM for this compose stack (~1–2 GB typical on Mac):
+#   node1–7 ~100MB each, grafana ~250MB, prometheus ~100MB, CP+web ~40MB.
+# If the VM is tight: lower Grafana retention, avoid extra sidecars, prefer arm64
+# images — do not drop the client 3D bundle.
 
 name: kmc
 
@@ -20,7 +27,9 @@ services:
       METRICS_ADDR: 0.0.0.0:9100
       PEERS: 2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000,6=node6:7000,7=node7:7000
       KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
+      # Slow KV heartbeat so commit indexes keep moving (proof of life).
       RUN_AGENT: "true"
+      AGENT_INTERVAL: "1500ms"
     volumes:
       - node1-data:/data
     networks: [kmc]
@@ -137,14 +146,14 @@ services:
       HTTP_ADDR: 0.0.0.0:8080
       CONTROL_NODES: 1=kmc-node-1,2=kmc-node-2,3=kmc-node-3,4=kmc-node-4,5=kmc-node-5,6=kmc-node-6,7=kmc-node-7
       CONTROL_NETWORK: kmc_kmc
-      HEAL_AFTER: 2s
+      HEAL_AFTER: 10s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8080:8080"
     networks: [kmc]
     restart: unless-stopped
-
+    depends_on: [node1, node2, node3, node4, node5, node6, node7]
   web:
     build: ../../web
     container_name: kmc-web
@@ -177,6 +186,10 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_USERS_DEFAULT_THEME: dark
+      # Allow embedding from the demo UI (localhost:5173 → :3000 iframe).
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_SECURITY_COOKIE_SAMESITE: disabled
+      GF_SECURITY_X_FRAME_OPTIONS: ""
     volumes:
       - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro

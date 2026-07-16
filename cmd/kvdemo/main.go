@@ -104,7 +104,7 @@ func main() {
 		fmt.Printf("  attempt %d...\n", attempt)
 		r := mustViaLeaderResult(members, func(cl *kv.Cluster) (kv.ApplyResult, error) {
 			return cl.ExecuteOnce(ctx, "agent-transfer", 9001, kv.Command{
-				Op: kv.OpPut, Key: "ledger", Value: []byte("paid-once"),
+				Op: kv.OpPut, Key: "demo/once", Value: []byte("paid-once"),
 			})
 		})
 		if !r.Duplicate {

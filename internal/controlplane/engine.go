@@ -9,7 +9,9 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
@@ -42,15 +44,15 @@ type Engine struct {
 	globalNext  time.Time
 
 	ipCooldown time.Duration
-	ipMu      sync.Mutex
-	ipLast    map[string]time.Time
+	ipMu       sync.Mutex
+	ipLast     map[string]time.Time
 
 	healAfter time.Duration
 	healMu    sync.Mutex
 	heals     map[uint64]*healJob
 
-	eventMu sync.Mutex
-	events  []Event
+	eventMu  sync.Mutex
+	events   []Event
 	eventCap int
 }
 
@@ -78,7 +80,7 @@ type Config struct {
 
 	GlobalKillsPerSec float64
 	IPCooldown        time.Duration
-	// HealAfter is how long a killed/partitioned node stays down (default 2s).
+	// HealAfter is how long a killed/partitioned machine stays down (default 10s).
 	HealAfter time.Duration
 }
 
@@ -111,14 +113,14 @@ func NewEngine(cfg Config) (*Engine, error) {
 	}
 	heal := cfg.HealAfter
 	if heal <= 0 {
-		heal = 2 * time.Second
+		heal = 10 * time.Second
 	}
 	return &Engine{
 		dockerBin:   bin,
 		network:     cfg.Network,
 		nodes:       nodes,
 		globalEvery: time.Duration(float64(time.Second) / rate),
-		ipCooldown:   ipCD,
+		ipCooldown:  ipCD,
 		ipLast:      make(map[string]time.Time),
 		healAfter:   heal,
 		heals:       make(map[uint64]*healJob),
@@ -150,7 +152,7 @@ func (e *Engine) Nodes() []Node {
 	return out
 }
 
-// Status is one node's live Docker state.
+// Status is one machine's live Docker + Raft state.
 type Status struct {
 	ID            uint64 `json:"id"`
 	ContainerName string `json:"container"`
@@ -159,25 +161,41 @@ type Status struct {
 	Partitioned   bool   `json:"partitioned"`
 	HealDueMs     int64  `json:"healDueMs"` // ms until auto-heal; 0 if none
 	HealKind      string `json:"healKind,omitempty"`
+	Term          uint64 `json:"term,omitempty"`
+	CommitIndex   uint64 `json:"commitIndex,omitempty"`
+	LeaderID      uint64 `json:"leaderId,omitempty"`
+	IsLeader      bool   `json:"isLeader,omitempty"`
+	Role          string `json:"role,omitempty"`
 }
 
 // Snapshot is the full cluster view for SSE/UI.
 type Snapshot struct {
-	Nodes    []Status `json:"nodes"`
-	Alive    int      `json:"alive"`
-	Total    int      `json:"total"`
-	Quorum   bool     `json:"quorum"`
-	HealAfterMs int64 `json:"healAfterMs"`
-	Events   []Event  `json:"events"`
+	Nodes       []Status  `json:"nodes"`
+	Alive       int       `json:"alive"`
+	Total       int       `json:"total"`
+	Quorum      bool      `json:"quorum"`
+	HealAfterMs int64     `json:"healAfterMs"`
+	LeaderID    uint64    `json:"leaderId,omitempty"`
+	Term        uint64    `json:"term,omitempty"`
+	Events []Event `json:"events"`
 }
 
 // Snapshot builds the current cluster view.
 func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 	list, _ := e.List(ctx)
 	alive := 0
+	var leaderID, term uint64
 	for _, n := range list {
 		if n.Running && !n.Partitioned {
 			alive++
+		}
+		if n.IsLeader {
+			leaderID = n.ID
+			term = n.Term
+		}
+		if leaderID == 0 && n.LeaderID != 0 {
+			leaderID = n.LeaderID
+			term = n.Term
 		}
 	}
 	total := len(list)
@@ -187,11 +205,13 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 		Total:       total,
 		Quorum:      alive > total/2,
 		HealAfterMs: e.healAfter.Milliseconds(),
+		LeaderID:    leaderID,
+		Term:        term,
 		Events:      e.Events(),
 	}
 }
 
-// List reports running/exited for every whitelisted node.
+// List reports running/exited for every whitelisted machine.
 func (e *Engine) List(ctx context.Context) ([]Status, error) {
 	nodes := e.Nodes()
 	out := make([]Status, 0, len(nodes))
@@ -204,6 +224,9 @@ func (e *Engine) List(ctx context.Context) ([]Status, error) {
 			}
 		}
 		e.attachHeal(&st)
+		if st.Running && !st.Partitioned {
+			e.attachRaft(ctx, &st)
+		}
 		out = append(out, st)
 	}
 	return out, nil
@@ -225,7 +248,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if err := e.run(ctx, "stop", "-t", "1", n.ContainerName); err != nil {
 			return err
 		}
-		e.addEvent("kill", fmt.Sprintf("Node %d killed — auto-heal in %s", id, e.healAfter))
+		e.addEvent("kill", fmt.Sprintf("Machine %d killed — auto-heal in %s", id, e.healAfter))
 		e.scheduleHeal(id, "start")
 		return nil
 
@@ -243,7 +266,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if st.Partitioned || e.network != "" {
 			_ = e.connectNetwork(ctx, n.ContainerName) // best-effort
 		}
-		e.addEvent("restart", fmt.Sprintf("Node %d restarted", id))
+		e.addEvent("restart", fmt.Sprintf("Machine %d restarted", id))
 		return nil
 
 	case ActionPartition:
@@ -259,15 +282,15 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 			return err
 		}
 		if !st.Running {
-			return fmt.Errorf("controlplane: node %d is not running", id)
+			return fmt.Errorf("controlplane: machine %d is not running", id)
 		}
 		if st.Partitioned {
-			return fmt.Errorf("controlplane: node %d already partitioned", id)
+			return fmt.Errorf("controlplane: machine %d already partitioned", id)
 		}
 		if err := e.run(ctx, "network", "disconnect", e.network, n.ContainerName); err != nil {
 			return err
 		}
-		e.addEvent("partition", fmt.Sprintf("Node %d partitioned — reconnect in %s", id, e.healAfter))
+		e.addEvent("partition", fmt.Sprintf("Machine %d partitioned — reconnect in %s", id, e.healAfter))
 		e.scheduleHeal(id, "reconnect")
 		return nil
 
@@ -334,6 +357,40 @@ func (e *Engine) attachHeal(st *Status) {
 		}
 		st.HealDueMs = ms
 	}
+}
+
+// attachRaft pulls live term/commit/leader from the machine metrics port
+// (compose service nodeN:9100). Best-effort — Docker state still drives kill UX.
+func (e *Engine) attachRaft(ctx context.Context, st *Status) {
+	url := fmt.Sprintf("http://node%d:9100/healthz", st.ID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return
+	}
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	res, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return
+	}
+	var body struct {
+		Term        uint64 `json:"term"`
+		CommitIndex uint64 `json:"commitIndex"`
+		LeaderID    uint64 `json:"leaderId"`
+		IsLeader    bool   `json:"isLeader"`
+		Role        string `json:"role"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return
+	}
+	st.Term = body.Term
+	st.CommitIndex = body.CommitIndex
+	st.LeaderID = body.LeaderID
+	st.IsLeader = body.IsLeader
+	st.Role = body.Role
 }
 
 func (e *Engine) scheduleHeal(id uint64, kind string) {

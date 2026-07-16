@@ -2,7 +2,7 @@
 //
 //	CONTROL_NODES=1=kmc-node-1,2=kmc-node-2,...
 //	CONTROL_NETWORK=kmc_kmc
-//	HEAL_AFTER=2s
+//	HEAL_AFTER=10s
 //	HTTP_ADDR=0.0.0.0:8080
 package main
 
@@ -21,7 +21,7 @@ func main() {
 	if err != nil {
 		fatalf("%v", err)
 	}
-	healAfter, err := time.ParseDuration(env("HEAL_AFTER", "2s"))
+	healAfter, err := time.ParseDuration(env("HEAL_AFTER", "10s"))
 	if err != nil {
 		fatalf("HEAL_AFTER: %v", err)
 	}

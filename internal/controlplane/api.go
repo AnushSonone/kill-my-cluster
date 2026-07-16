@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Server exposes the whitelist HTTP API (+ optional tiny kill UI).
+// Server exposes the whitelist HTTP API (+ tiny kill UI).
 type Server struct {
 	engine *Engine
 	mux    *http.ServeMux

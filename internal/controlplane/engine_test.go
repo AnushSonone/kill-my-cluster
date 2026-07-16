@@ -10,7 +10,7 @@ func TestAllowDisruptRateLimits(t *testing.T) {
 	e := &Engine{
 		nodes:       map[uint64]Node{1: {ID: 1, ContainerName: "n1"}},
 		globalEvery: 200 * time.Millisecond,
-		ipCooldown:   500 * time.Millisecond,
+		ipCooldown:  500 * time.Millisecond,
 		ipLast:      make(map[string]time.Time),
 		heals:       make(map[uint64]*healJob),
 	}

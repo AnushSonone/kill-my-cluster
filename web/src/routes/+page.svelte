@@ -1,23 +1,82 @@
 <script lang="ts">
   import ClusterGraph from '$lib/ClusterGraph.svelte';
   import type { Snapshot } from '$lib/types';
-  import { isHealthy } from '$lib/types';
-  import { onMount } from 'svelte';
+  import { GRAFANA_EMBED } from '$lib/types';
+  import { preferCluster3D } from '$lib/webgl';
+  import { onMount, type Component } from 'svelte';
 
   let snap = $state<Snapshot | null>(null);
   let selectedId = $state<number | null>(null);
   let toast = $state('');
   let busy = $state(false);
   let live = $state(false);
+  let grafanaOpen = $state(false);
+  /** null until client decides; then ClusterScene or stays null for SVG. */
+  let ClusterScene = $state<Component<{
+    nodes: Snapshot['nodes'];
+    selectedId: number | null;
+    onselect: (id: number) => void;
+  }> | null>(null);
+  let use3d = $state(false);
+  /** Kill ids waiting for Docker to report exited — stops SSE from undoing optimistic UI. */
+  const pendingKills = new Map<number, number>();
+
+  let healLabel = $derived(snap ? `${(snap.healAfterMs / 1000).toFixed(0)}s` : '…');
+  let selected = $derived(snap?.nodes.find((n) => n.id === selectedId) ?? null);
+
+  let canKill = $derived(
+    !!selectedId &&
+      !busy &&
+      !!snap?.quorum &&
+      !!selected &&
+      selected.running &&
+      !selected.partitioned
+  );
+
+  function applySnapshot(raw: Snapshot) {
+    const nodes = raw.nodes.map((n) => {
+      const deadline = pendingKills.get(n.id);
+      if (deadline == null) return n;
+      if (!n.running) {
+        pendingKills.delete(n.id);
+        return n;
+      }
+      // Still "running" in SSE — keep showing the kill until Docker catches up.
+      return {
+        ...n,
+        running: false,
+        status: 'exited',
+        isLeader: false,
+        healDueMs: Math.max(n.healDueMs, deadline - Date.now()),
+        healKind: n.healKind || 'start'
+      };
+    });
+    const alive = nodes.filter((n) => n.running && !n.partitioned).length;
+    snap = { ...raw, nodes, alive, quorum: alive > raw.total / 2 };
+  }
 
   onMount(() => {
+    let cancelled = false;
+    if (preferCluster3D()) {
+      import('$lib/ClusterScene.svelte')
+        .then((mod) => {
+          if (cancelled) return;
+          ClusterScene = mod.default;
+          use3d = true;
+        })
+        .catch(() => {
+          use3d = false;
+        });
+    }
+
     const es = new EventSource('/api/stream');
     es.onmessage = (ev) => {
       try {
-        snap = JSON.parse(ev.data) as Snapshot;
+        applySnapshot(JSON.parse(ev.data) as Snapshot);
         live = true;
-        if (selectedId == null && snap.nodes.length) {
-          selectedId = snap.nodes[0].id;
+        if (selectedId == null && snap?.nodes.length) {
+          const leader = snap.nodes.find((n) => n.isLeader);
+          selectedId = leader?.id ?? snap.nodes[0].id;
         }
       } catch {
         /* ignore */
@@ -26,34 +85,43 @@
     es.onerror = () => {
       live = false;
     };
-    return () => es.close();
+    return () => {
+      cancelled = true;
+      es.close();
+    };
   });
 
-  let selected = $derived(snap?.nodes.find((n) => n.id === selectedId) ?? null);
-
-  async function act(action: 'kill' | 'restart' | 'partition') {
-    if (!selectedId || busy) return;
+  async function killSelected() {
+    if (!selectedId || !canKill || !snap) return;
+    const id = selectedId;
     busy = true;
-    toast = `${action} node ${selectedId}…`;
+    toast = `Killing Machine ${id}…`;
+    const healMs = snap.healAfterMs;
+    pendingKills.set(id, Date.now() + healMs);
+    applySnapshot({
+      ...snap,
+      nodes: snap.nodes.map((n) =>
+        n.id === id
+          ? {
+              ...n,
+              running: false,
+              status: 'exited',
+              isLeader: false,
+              role: undefined,
+              healDueMs: healMs,
+              healKind: 'start'
+            }
+          : n
+      )
+    });
     try {
-      const res = await fetch(`/api/nodes/${selectedId}/${action}`, { method: 'POST' });
+      const res = await fetch(`/api/nodes/${id}/kill`, { method: 'POST' });
       const text = await res.text();
-      toast = res.ok ? `ok — ${action} node ${selectedId}` : text;
+      toast = res.ok ? `Machine ${id} down · heals in ${healLabel}` : text;
+      if (!res.ok) pendingKills.delete(id);
     } catch (err) {
       toast = String(err);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function resetAll() {
-    busy = true;
-    toast = 'reset all…';
-    try {
-      const res = await fetch('/api/reset', { method: 'POST' });
-      toast = res.ok ? 'ok — reset all' : await res.text();
-    } catch (err) {
-      toast = String(err);
+      pendingKills.delete(id);
     } finally {
       busy = false;
     }
@@ -64,30 +132,11 @@
   <title>Kill My Cluster</title>
 </svelte:head>
 
-<main>
-  <header>
-    <div>
-      <h1>Kill My Cluster</h1>
-      <p class="sub">
-        Live Raft mesh — kill or partition a node and watch auto-heal reconnect the graph.
-        <span class="dot" class:on={live}></span>
-        {live ? 'live' : 'reconnecting…'}
-      </p>
-    </div>
-    <a class="grafana" href="http://localhost:3000" target="_blank" rel="noreferrer">Grafana ↗</a>
-  </header>
-
-  {#if snap && !snap.quorum}
-    <div class="banner">
-      <strong>Quorum lost.</strong> A majority of nodes must be healthy — the cluster chooses safety
-      over lying.
-    </div>
-  {/if}
-
-  <div class="layout">
-    <section class="stage">
-      {#if snap}
-        <ClusterGraph
+<main class:immersive={use3d}>
+  <div class="stage" class:fullscreen={use3d}>
+    {#if snap}
+      {#if use3d && ClusterScene}
+        <ClusterScene
           nodes={snap.nodes}
           {selectedId}
           onselect={(id) => {
@@ -95,155 +144,126 @@
           }}
         />
       {:else}
-        <p class="loading">Connecting to control plane…</p>
+        <ClusterGraph
+          nodes={snap.nodes}
+          {selectedId}
+          onselect={(id) => {
+            selectedId = id;
+          }}
+        />
       {/if}
-    </section>
-
-    <aside class="panel">
-      <div class="stats">
-        {#if snap}
-          <div><span>Alive</span><strong>{snap.alive}/{snap.total}</strong></div>
-          <div><span>Quorum</span><strong class:bad={!snap.quorum}>{snap.quorum ? 'yes' : 'NO'}</strong></div>
-          <div><span>Heal</span><strong>{snap.healAfterMs}ms</strong></div>
-        {/if}
-      </div>
-
-      {#if selected}
-        <h2>Node {selected.id}</h2>
-        <p class="meta">{selected.container}</p>
-        <p class="meta">
-          {#if isHealthy(selected)}
-            healthy on the mesh
-          {:else if !selected.running}
-            offline
-          {:else}
-            partitioned (off network)
-          {/if}
-          {#if selected.healDueMs > 0}
-            · healing in {(selected.healDueMs / 1000).toFixed(1)}s
-          {/if}
-        </p>
-        <div class="actions">
-          <button class="kill" disabled={busy || !selected.running || selected.partitioned} onclick={() => act('kill')}
-            >Kill</button
-          >
-          <button
-            class="partition"
-            disabled={busy || !selected.running || selected.partitioned}
-            onclick={() => act('partition')}>Partition</button
-          >
-          <button
-            class="restart"
-            disabled={busy || (selected.running && !selected.partitioned)}
-            onclick={() => act('restart')}>Restart</button
-          >
-        </div>
-      {:else}
-        <p class="meta">Select a node on the graph.</p>
-      {/if}
-
-      <button class="reset" disabled={busy} onclick={resetAll}>Reset all</button>
-      <p class="toast">{toast}</p>
-
-      <h3>Feed</h3>
-      <div class="feed">
-        {#if snap}
-          {#each [...snap.events].reverse() as ev}
-            <div class="ev">
-              <strong>{ev.kind}</strong>
-              {new Date(ev.time).toLocaleTimeString()} — {ev.message}
-            </div>
-          {/each}
-        {/if}
-      </div>
-    </aside>
+    {:else}
+      <p class="loading">Connecting…</p>
+    {/if}
   </div>
+
+  <header class="hud-top">
+    <h1>Kill My Cluster</h1>
+    <span class="live" class:on={live}>{live ? 'live' : '…'}</span>
+    {#if use3d}
+      <span class="hint">scroll to zoom · drag to orbit</span>
+    {/if}
+  </header>
+
+  {#if snap && !snap.quorum}
+    <div class="banner">Quorum lost — waiting for majority.</div>
+  {/if}
+
+  <aside class="hud-panel">
+    <div class="stats">
+      {#if snap}
+        <div><span>Alive</span><strong>{snap.alive}/{snap.total}</strong></div>
+        <div><span>Leader</span><strong>{snap.leaderId ? `M${snap.leaderId}` : '—'}</strong></div>
+        <div><span>Term</span><strong>{snap.term ?? '—'}</strong></div>
+        <div><span>Heal</span><strong>{healLabel}</strong></div>
+      {/if}
+    </div>
+
+    <button class="kill" disabled={!canKill} onclick={killSelected}>
+      {selected ? `Kill Machine ${selected.id}` : 'Select a machine'}
+    </button>
+    {#if toast}
+      <p class="toast">{toast}</p>
+    {/if}
+
+    <h3>Feed</h3>
+    <div class="feed">
+      {#if snap}
+        {#each [...snap.events].reverse().slice(0, 12) as ev}
+          <div class="ev">
+            <strong>{ev.kind}</strong>
+            {new Date(ev.time).toLocaleTimeString()} — {ev.message}
+          </div>
+        {/each}
+      {/if}
+    </div>
+  </aside>
+
+  <button
+    type="button"
+    class="grafana-tab"
+    class:open={grafanaOpen}
+    aria-expanded={grafanaOpen}
+    aria-controls="grafana-drawer"
+    onclick={() => (grafanaOpen = !grafanaOpen)}
+  >
+    Grafana
+  </button>
+
+  <aside id="grafana-drawer" class="grafana-drawer" class:open={grafanaOpen} aria-hidden={!grafanaOpen}>
+    <div class="grafana-head">
+      <strong>Grafana</strong>
+      <a href="http://localhost:3000/d/kmc-overview/kill-my-cluster" target="_blank" rel="noreferrer"
+        >Open ↗</a
+      >
+      <button type="button" class="close" onclick={() => (grafanaOpen = false)}>Close</button>
+    </div>
+    {#if grafanaOpen}
+      <iframe
+        class="grafana-frame"
+        title="Kill My Cluster Grafana"
+        src={GRAFANA_EMBED}
+        loading="lazy"
+        referrerpolicy="no-referrer"
+      ></iframe>
+    {/if}
+  </aside>
 </main>
 
 <style>
   :global(html, body) {
     margin: 0;
-    min-height: 100%;
-    background: radial-gradient(ellipse at top, #152030 0%, #0b0f14 55%);
+    height: 100%;
+    overflow: hidden;
+    background: #0b0f14;
     color: #e8eef4;
     font-family: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
   }
 
   main {
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 1.5rem 1.25rem 2.5rem;
+    position: relative;
+    min-height: 100vh;
+    min-height: 100dvh;
   }
 
-  header {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    align-items: flex-start;
-    margin-bottom: 1rem;
-  }
-
-  h1 {
-    margin: 0;
-    font-size: 1.5rem;
-    letter-spacing: -0.02em;
-  }
-
-  .sub {
-    margin: 0.35rem 0 0;
-    color: #7a8fa3;
-    font-size: 0.92rem;
-  }
-
-  .dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #ff5c5c;
-    margin: 0 0.25rem 0 0.5rem;
-    vertical-align: middle;
-  }
-
-  .dot.on {
-    background: #3dd68c;
-  }
-
-  .grafana {
-    color: #f0c14b;
-    text-decoration: none;
-    font-size: 0.9rem;
-    white-space: nowrap;
-  }
-
-  .banner {
-    margin-bottom: 1rem;
-    padding: 0.75rem 1rem;
-    border-radius: 8px;
-    background: rgba(255, 92, 92, 0.12);
-    border: 1px solid rgba(255, 92, 92, 0.35);
-    color: #ffb4b4;
-  }
-
-  .layout {
-    display: grid;
-    grid-template-columns: 1.4fr 0.9fr;
-    gap: 1.25rem;
-    align-items: start;
-  }
-
-  @media (max-width: 860px) {
-    .layout {
-      grid-template-columns: 1fr;
-    }
+  main.immersive {
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
   }
 
   .stage {
-    background: #121a24;
-    border: 1px solid #1e2d3d;
-    border-radius: 14px;
-    padding: 0.75rem;
+    position: relative;
     min-height: 360px;
+    background: #121a24;
+  }
+
+  .stage.fullscreen {
+    position: absolute;
+    inset: 0;
+    min-height: 0;
+    background: transparent;
+    z-index: 0;
   }
 
   .loading {
@@ -252,17 +272,74 @@
     padding: 4rem 1rem;
   }
 
-  .panel {
-    background: #121a24;
+  .hud-top {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2;
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 1rem 1.25rem;
+    pointer-events: none;
+    background: linear-gradient(to bottom, rgba(11, 15, 20, 0.72), transparent);
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 1.35rem;
+    letter-spacing: -0.02em;
+  }
+
+  .live {
+    font-size: 0.8rem;
+    color: #7a8fa3;
+  }
+
+  .live.on {
+    color: #3dd68c;
+  }
+
+  .hint {
+    margin-left: auto;
+    font-size: 0.72rem;
+    color: #5a6f82;
+  }
+
+  .banner {
+    position: absolute;
+    top: 3.4rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3;
+    padding: 0.65rem 1rem;
+    border-radius: 8px;
+    background: rgba(255, 92, 92, 0.16);
+    border: 1px solid rgba(255, 92, 92, 0.4);
+    color: #ffb4b4;
+    pointer-events: none;
+  }
+
+  .hud-panel {
+    position: absolute;
+    top: 4.25rem;
+    right: 1rem;
+    z-index: 2;
+    width: min(280px, calc(100vw - 2rem));
+    max-height: calc(100vh - 5.5rem);
+    overflow: auto;
+    background: rgba(18, 26, 36, 0.88);
     border: 1px solid #1e2d3d;
     border-radius: 14px;
     padding: 1rem 1.1rem;
+    backdrop-filter: blur(10px);
   }
 
   .stats {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 0.5rem;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.55rem;
     margin-bottom: 1rem;
     padding-bottom: 0.85rem;
     border-bottom: 1px solid #1e2d3d;
@@ -277,16 +354,7 @@
   }
 
   .stats strong {
-    font-size: 1.05rem;
-  }
-
-  .stats strong.bad {
-    color: #ff5c5c;
-  }
-
-  h2 {
-    margin: 0;
-    font-size: 1.1rem;
+    font-size: 1.02rem;
   }
 
   h3 {
@@ -297,22 +365,10 @@
     color: #7a8fa3;
   }
 
-  .meta {
-    color: #7a8fa3;
-    font-size: 0.85rem;
-    margin: 0.25rem 0 0.85rem;
-  }
-
-  .actions {
-    display: flex;
-    gap: 0.4rem;
-    flex-wrap: wrap;
-  }
-
   button {
     font: inherit;
-    font-size: 0.8rem;
-    padding: 0.45rem 0.65rem;
+    font-size: 0.9rem;
+    padding: 0.65rem 0.75rem;
     border-radius: 7px;
     border: 1px solid #1e2d3d;
     background: #1a2634;
@@ -326,34 +382,21 @@
   }
 
   .kill {
-    border-color: rgba(255, 92, 92, 0.45);
-    color: #ffb4b4;
-  }
-
-  .partition {
-    border-color: rgba(183, 148, 246, 0.45);
-    color: #b794f6;
-  }
-
-  .restart {
-    border-color: rgba(61, 214, 140, 0.4);
-    color: #3dd68c;
-  }
-
-  .reset {
     width: 100%;
-    margin-top: 0.75rem;
+    border-color: rgba(255, 92, 92, 0.5);
+    color: #ffb4b4;
+    font-weight: 650;
   }
 
   .toast {
     min-height: 1.2em;
     color: #7a8fa3;
     font-size: 0.82rem;
-    margin: 0.6rem 0 0;
+    margin: 0.65rem 0 0;
   }
 
   .feed {
-    max-height: 220px;
+    max-height: 180px;
     overflow-y: auto;
     font-size: 0.78rem;
     color: #7a8fa3;
@@ -366,5 +409,94 @@
 
   .ev strong {
     color: #e8eef4;
+  }
+
+  .grafana-tab {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    z-index: 4;
+    transform: translateY(-50%);
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    padding: 1rem 0.45rem;
+    border-radius: 0 10px 10px 0;
+    border: 1px solid #1e2d3d;
+    border-left: 0;
+    background: rgba(18, 26, 36, 0.92);
+    color: #f0c14b;
+    font-size: 0.78rem;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    backdrop-filter: blur(8px);
+  }
+
+  .grafana-tab.open {
+    left: min(420px, 92vw);
+  }
+
+  .grafana-drawer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 3;
+    width: min(420px, 92vw);
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: rgba(11, 15, 20, 0.96);
+    border-right: 1px solid #1e2d3d;
+    transform: translateX(-105%);
+    transition: transform 0.22s ease;
+    pointer-events: none;
+  }
+
+  .grafana-drawer.open {
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  .grafana-head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.85rem 1rem;
+    border-bottom: 1px solid #1e2d3d;
+  }
+
+  .grafana-head a {
+    color: #f0c14b;
+    text-decoration: none;
+    font-size: 0.82rem;
+  }
+
+  .grafana-head .close {
+    margin-left: auto;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.78rem;
+  }
+
+  .grafana-frame {
+    flex: 1;
+    width: 100%;
+    border: 0;
+    background: #0b0f14;
+    min-height: 0;
+  }
+
+  @media (max-width: 720px) {
+    .hud-panel {
+      top: auto;
+      bottom: 1rem;
+      right: 1rem;
+      left: 1rem;
+      width: auto;
+      max-height: 38vh;
+    }
+
+    .hint {
+      display: none;
+    }
   }
 </style>

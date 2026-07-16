@@ -1,7 +1,7 @@
 package kv
 
 // client.go is a remote KV client that dials any node and retries on
-// NotLeader until it hits the current Raft leader. Used by the bank agent
+// NotLeader until it hits the current Raft leader. Used by the traffic agent
 // when nodes run in separate containers.
 
 import (

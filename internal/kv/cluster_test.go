@@ -247,7 +247,7 @@ func TestCASAndCheckpoint(t *testing.T) {
 	ctx := context.Background()
 
 	err := c.proposeViaLeader(ctx, func(cl *Cluster) error {
-		_, err := cl.Put(ctx, "bank", 1, "ledger", []byte("1000"))
+		_, err := cl.Put(ctx, "client", 1, "balance", []byte("1000"))
 		return err
 	})
 	if err != nil {
@@ -255,7 +255,7 @@ func TestCASAndCheckpoint(t *testing.T) {
 	}
 
 	err = c.proposeViaLeader(ctx, func(cl *Cluster) error {
-		res, err := cl.CAS(ctx, "bank", 2, "ledger", []byte("1000"), []byte("999"))
+		res, err := cl.CAS(ctx, "client", 2, "balance", []byte("1000"), []byte("999"))
 		if err != nil {
 			return err
 		}

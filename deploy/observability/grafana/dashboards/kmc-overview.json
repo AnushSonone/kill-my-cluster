@@ -9,7 +9,7 @@
     {
       "title": "Who is leader?",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -29,7 +29,7 @@
     {
       "title": "Raft term",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -42,7 +42,7 @@
     {
       "title": "Commit index (lockstep = healthy replication)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 10 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -53,67 +53,9 @@
       ]
     },
     {
-      "title": "Propose latency (p50 / p99)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": { "drawStyle": "line", "fillOpacity": 10 }
-        }
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(kmc_propose_latency_seconds_bucket[30s])))",
-          "legendFormat": "p50",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kmc_propose_latency_seconds_bucket[30s])))",
-          "legendFormat": "p99",
-          "refId": "B"
-        }
-      ]
-    },
-    {
-      "title": "Bank totals (real vs naive)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "currencyUSD",
-          "custom": { "drawStyle": "line", "fillOpacity": 15 }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "real" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
-          },
-          {
-            "matcher": { "id": "byName", "options": "naive" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
-          }
-        ]
-      },
-      "targets": [
-        {
-          "expr": "kmc_bank_real_total_cents / 100",
-          "legendFormat": "real",
-          "refId": "A"
-        },
-        {
-          "expr": "kmc_bank_naive_total_cents / 100",
-          "legendFormat": "naive",
-          "refId": "B"
-        }
-      ]
-    },
-    {
       "title": "Applies / sec (cluster throughput)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 10 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -132,5 +74,5 @@
   "timezone": "browser",
   "title": "Kill My Cluster",
   "uid": "kmc-overview",
-  "version": 1
+  "version": 2
 }

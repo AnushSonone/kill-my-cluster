@@ -8,12 +8,13 @@
 //	KV_ADDR=0.0.0.0:8000
 //	METRICS_ADDR=0.0.0.0:9100
 //	PEERS=2=node2:7000,3=node3:7000          # other Raft peers (id=host:port)
-//	KV_PEERS=1=node1:8000,2=node2:8000,...   # all KV endpoints (for optional agent)
+//	KV_PEERS=1=node1:8000,2=node2:8000,...   # all KV endpoints (for traffic agent)
 //	RUN_AGENT=true                           # only one node should set this
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -23,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AnushSonone/kill-my-cluster/internal/bank"
 	"github.com/AnushSonone/kill-my-cluster/internal/kv"
 	"github.com/AnushSonone/kill-my-cluster/internal/metrics"
 	"github.com/AnushSonone/kill-my-cluster/internal/raft"
@@ -66,8 +66,18 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", col.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		rn := cl.Raft()
+		term, isLeader := rn.Status()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":          true,
+			"id":          cfg.id,
+			"term":        term,
+			"commitIndex": rn.CommitIndex(),
+			"leaderId":    rn.LeaderID(),
+			"isLeader":    isLeader,
+			"role":        rn.Role().String(),
+		})
 	})
 	httpSrv := &http.Server{Addr: cfg.metricsAddr, Handler: mux}
 	go func() {
@@ -84,8 +94,8 @@ func main() {
 	var kvClient *kv.Client
 	if cfg.runAgent {
 		kvClient = kv.NewClient(cfg.kvPeers)
-		go runAgent(ctx, kvClient, col)
-		fmt.Println("  bank agent starting (waits for quorum)…")
+		go runTraffic(ctx, kvClient)
+		fmt.Println("  traffic agent starting (waits for quorum)…")
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -137,7 +147,7 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("RUN_AGENT=true requires KV_PEERS")
 	}
 	return config{
-		id: id,
+		id:          id,
 		dataDir:     env("DATA_DIR", "/data"),
 		raftAddr:    env("RAFT_ADDR", "0.0.0.0:7000"),
 		kvAddr:      env("KV_ADDR", "0.0.0.0:8000"),
@@ -173,55 +183,39 @@ func parsePeers(s string) (map[uint64]string, error) {
 	return out, nil
 }
 
-func runAgent(ctx context.Context, client *kv.Client, col *metrics.Collector) {
-	b := bank.NewBankStore(client)
-	for {
-		if err := ctx.Err(); err != nil {
-			return
-		}
-		if err := b.Init(ctx); err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		break
-	}
-	naive, err := bank.NewNaiveLedger()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "naive: %v\n", err)
-		return
-	}
-	agent, err := bank.NewAgent(bank.AgentConfig{
-		Bank: b, Naive: naive,
-		Interval: 300 * time.Millisecond, DuplicateRate: 0.3, MaxAmountCents: 250,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
-		return
-	}
-	agent.Start(ctx)
-	defer agent.Stop()
-	fmt.Println("  bank agent running")
-	reportBank(ctx, agent, col)
-}
-
-func reportBank(ctx context.Context, agent *bank.Agent, col *metrics.Collector) {
-	var last uint64
-	t := time.NewTicker(500 * time.Millisecond)
+// runTraffic writes a heartbeat key on an interval so commit indexes / applies
+// keep moving for the public proof (Grafana + mesh pulse).
+func runTraffic(ctx context.Context, client *kv.Client) {
+	interval := agentInterval()
+	var seq uint64
+	fmt.Printf("  traffic agent running (interval %s)\n", interval)
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			snap, err := agent.Stats(ctx)
+			seq++
+			val := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+			_, err := client.ExecuteOnce(ctx, "traffic", seq, kv.Command{
+				Op: kv.OpPut, Key: "demo/heartbeat", Value: val,
+			})
 			if err != nil {
-				continue
+				// No quorum yet — reuse the same request id on the next tick.
+				seq--
 			}
-			delta := snap.AgentTransfers - last
-			last = snap.AgentTransfers
-			col.SetBank(snap.RealTotalCents, snap.NaiveTotalCents, snap.DriftCents, delta)
 		}
 	}
+}
+
+func agentInterval() time.Duration {
+	if v := os.Getenv("AGENT_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 1500 * time.Millisecond
 }
 
 func env(k, def string) string {

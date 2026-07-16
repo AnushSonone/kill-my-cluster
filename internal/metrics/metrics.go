@@ -28,11 +28,6 @@ type Collector struct {
 	proposalsTotal prometheus.Counter
 	appliesTotal   prometheus.Counter
 	proposeLatency prometheus.Histogram
-
-	bankRealCents  prometheus.Gauge
-	bankNaiveCents prometheus.Gauge
-	bankDriftCents prometheus.Gauge
-	bankTransfers  prometheus.Counter
 }
 
 // NewCollector registers series for the given node ID.
@@ -85,22 +80,6 @@ func NewCollector(nodeID uint64) *Collector {
 		ConstLabels: labels,
 		Buckets:     []float64{.001, .002, .005, .01, .025, .05, .1, .25, .5, 1, 2.5},
 	})
-	c.bankRealCents = factory.NewGauge(prometheus.GaugeOpts{
-		Name: "kmc_bank_real_total_cents",
-		Help: "Real bank ledger total in cents (should stay at 100000)",
-	})
-	c.bankNaiveCents = factory.NewGauge(prometheus.GaugeOpts{
-		Name: "kmc_bank_naive_total_cents",
-		Help: "Naive twin ledger total in cents (drifts upward on duplicate credits)",
-	})
-	c.bankDriftCents = factory.NewGauge(prometheus.GaugeOpts{
-		Name: "kmc_bank_drift_cents",
-		Help: "Naive total minus the canonical $1,000 (100000 cents)",
-	})
-	c.bankTransfers = factory.NewCounter(prometheus.CounterOpts{
-		Name: "kmc_bank_transfers_total",
-		Help: "Successful real-bank transfers observed by the metrics process",
-	})
 
 	return c
 }
@@ -131,17 +110,6 @@ func (c *Collector) ObservePropose(d time.Duration) {
 
 // IncApply increments the applied-command counter.
 func (c *Collector) IncApply() { c.appliesTotal.Inc() }
-
-// SetBank updates the tenant headline gauges. Call from one process only
-// (the metricsdemo agent owner) to avoid double-counting transfers.
-func (c *Collector) SetBank(realCents, naiveCents, driftCents int64, transfersDelta uint64) {
-	c.bankRealCents.Set(float64(realCents))
-	c.bankNaiveCents.Set(float64(naiveCents))
-	c.bankDriftCents.Set(float64(driftCents))
-	if transfersDelta > 0 {
-		c.bankTransfers.Add(float64(transfersDelta))
-	}
-}
 
 // RoleInt maps raft.Role string values to the gauge encoding.
 func RoleInt(role string) int {

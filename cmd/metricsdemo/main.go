@@ -1,5 +1,5 @@
-// metricsdemo runs a 3-node cluster with Prometheus /metrics endpoints and
-// the bank tenant so Grafana has live series to graph.
+// metricsdemo runs a 3-node cluster with Prometheus /metrics endpoints and a
+// light KV write loop so Grafana has live Raft/apply series to graph.
 //
 // Usage (from repo root, with observability stack up — see deploy/observability):
 //
@@ -19,7 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AnushSonone/kill-my-cluster/internal/bank"
 	"github.com/AnushSonone/kill-my-cluster/internal/kv"
 	"github.com/AnushSonone/kill-my-cluster/internal/metrics"
 	"github.com/AnushSonone/kill-my-cluster/internal/raft"
@@ -40,35 +39,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	clusters, collectors, cleanup := startCluster(ctx, base)
+	clusters, _, cleanup := startCluster(ctx, base)
 	defer cleanup()
 
 	fmt.Println("--- waiting for leader ---")
 	waitForLeader(clusters, 5*time.Second)
 
-	b := bank.NewBank(clusters...)
-	if err := b.Init(ctx); err != nil {
-		fatalf("bank init: %v", err)
-	}
-	naive, err := bank.NewNaiveLedger()
-	if err != nil {
-		fatalf("naive: %v", err)
-	}
-	agent, err := bank.NewAgent(bank.AgentConfig{
-		Bank:           b,
-		Naive:          naive,
-		Interval:       300 * time.Millisecond,
-		DuplicateRate:  0.3,
-		MaxAmountCents: 250,
-	})
-	if err != nil {
-		fatalf("agent: %v", err)
-	}
-	agent.Start(ctx)
-	defer agent.Stop()
-
-	// Bank gauges live on node 1's registry (one place — avoids triple-counting).
-	go reportBank(ctx, agent, collectors[0])
+	go runTraffic(ctx, clusters)
 
 	fmt.Println("\nKill My Cluster — metrics demo")
 	fmt.Printf("  data: %s\n", base)
@@ -156,22 +133,33 @@ func startCluster(ctx context.Context, base string) ([]*kv.Cluster, []*metrics.C
 	}
 }
 
-func reportBank(ctx context.Context, agent *bank.Agent, col *metrics.Collector) {
-	var lastTransfers uint64
-	t := time.NewTicker(500 * time.Millisecond)
+func runTraffic(ctx context.Context, clusters []*kv.Cluster) {
+	var seq uint64
+	t := time.NewTicker(300 * time.Millisecond)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			snap, err := agent.Stats(ctx)
-			if err != nil {
+			var leader *kv.Cluster
+			for _, cl := range clusters {
+				if cl.IsLeader() {
+					leader = cl
+					break
+				}
+			}
+			if leader == nil {
 				continue
 			}
-			delta := snap.AgentTransfers - lastTransfers
-			lastTransfers = snap.AgentTransfers
-			col.SetBank(snap.RealTotalCents, snap.NaiveTotalCents, snap.DriftCents, delta)
+			seq++
+			val := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+			_, err := leader.ExecuteOnce(ctx, "traffic", seq, kv.Command{
+				Op: kv.OpPut, Key: "demo/heartbeat", Value: val,
+			})
+			if err != nil {
+				seq--
+			}
 		}
 	}
 }
