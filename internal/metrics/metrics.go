@@ -27,6 +27,8 @@ type Collector struct {
 
 	proposalsTotal prometheus.Counter
 	appliesTotal   prometheus.Counter
+	writesTotal    prometheus.Counter
+	readsTotal     prometheus.Counter
 	proposeLatency prometheus.Histogram
 }
 
@@ -74,6 +76,16 @@ func NewCollector(nodeID uint64) *Collector {
 		Help:        "Committed commands applied to the KV state machine",
 		ConstLabels: labels,
 	})
+	c.writesTotal = factory.NewCounter(prometheus.CounterOpts{
+		Name:        "kmc_kv_writes_total",
+		Help:        "Committed Put/CAS commands applied to the KV state machine",
+		ConstLabels: labels,
+	})
+	c.readsTotal = factory.NewCounter(prometheus.CounterOpts{
+		Name:        "kmc_kv_reads_total",
+		Help:        "Committed Get commands applied to the KV state machine",
+		ConstLabels: labels,
+	})
 	c.proposeLatency = factory.NewHistogram(prometheus.HistogramOpts{
 		Name:        "kmc_propose_latency_seconds",
 		Help:        "Time from Propose to local apply (linearizable write latency)",
@@ -110,6 +122,12 @@ func (c *Collector) ObservePropose(d time.Duration) {
 
 // IncApply increments the applied-command counter.
 func (c *Collector) IncApply() { c.appliesTotal.Inc() }
+
+// IncWrite increments the Put/CAS counter.
+func (c *Collector) IncWrite() { c.writesTotal.Inc() }
+
+// IncRead increments the Get counter.
+func (c *Collector) IncRead() { c.readsTotal.Inc() }
 
 // RoleInt maps raft.Role string values to the gauge encoding.
 func RoleInt(role string) int {

@@ -12,7 +12,8 @@ catch-up and a **10s** auto-heal. Fullscreen Threlte 3D mesh + collapsible Grafa
 - **Phase 4 — Observability (Prometheus + Grafana).** ← *done*
 - **Docker cluster** — 7 machines + control plane + web. ← *done*
 - **Demo web UI** — fullscreen Threlte 3D (+ SVG `?view=svg`). ← *done*
-- Later — host on Oracle Always Free (`demo.anush.wiki`).
+- Public UI: [anush.wiki/blog/raft](https://anush.wiki/blog/raft) (wiki). No `demo.anush.wiki`.
+- Hosted compose: Oracle VM + loadgen; see `migration_anush_wiki.md` and `deploy/oracle/README.md`.
 
 ## Layout
 
@@ -20,14 +21,15 @@ catch-up and a **10s** auto-heal. Fullscreen Threlte 3D mesh + collapsible Grafa
 internal/storage/      WAL + durable storage
 internal/raft/         Raft consensus
 internal/kv/           replicated KV + remote Client
-internal/metrics/      Prometheus collectors (Raft / apply)
-internal/controlplane/ kill / partition / restart + SSE
+internal/metrics/      Prometheus collectors (Raft / apply / writes / reads)
+internal/controlplane/ kill / partition / restart + SSE + presence/QPS
 cmd/node/              Docker node entrypoint (+ optional KV heartbeat agent)
+cmd/loadgen/           sustained Put/Get traffic (~1.5K / ~10K targets)
 cmd/controlplane/      whitelist kill switch
 cmd/*demo/             phase demos (storage / raft / kv / metrics)
 deploy/observability/  Prometheus + Grafana only (host scrape)
-deploy/compose/        Full stack: 7 nodes + Prom/Grafana/CP/web
-web/                   SvelteKit demo UI (Threlte 3D)
+deploy/compose/        Full stack: 7 nodes + Prom/Grafana/CP/web/loadgen
+web/                   SvelteKit local demo UI (Threlte 3D); public UI is the wiki
 ```
 
 ## Requirements
@@ -54,7 +56,7 @@ go run ./cmd/kvdemo
 ```bash
 cd deploy/observability && docker compose up -d
 go run ./cmd/metricsdemo
-# Grafana http://localhost:3000  (admin/admin)
+# Grafana http://localhost:3001  (admin/admin)
 ```
 
 ### Docker cluster (preferred)
@@ -62,17 +64,21 @@ go run ./cmd/metricsdemo
 ```bash
 cd deploy/compose
 docker compose up -d --build
+# Oracle VM overlay (no local Svelte web, Prometheus unpublished):
+# docker compose -f docker-compose.yml -f docker-compose.oracle.yml up -d --build
 ```
 
 | Service        | URL                     | Notes                                      |
 |----------------|-------------------------|--------------------------------------------|
-| Demo UI        | http://localhost:5173   | Kill Machine N · 3D mesh · Grafana drawer  |
+| Public UI      | anush.wiki/blog/raft    | Wiki HUD + kill (proxies `/api/raft`)      |
+| Local web      | http://localhost:5173   | Optional Threlte UI                        |
 | Control plane  | http://localhost:8080   | Kill / partition / restart · heal ~10s · SSE |
-| Grafana        | http://localhost:3000   | `admin` / `admin` — 4 Raft panels          |
+| Grafana        | http://localhost:3001   | `admin` / `admin` — leader/term/writes/reads |
 | Prometheus     | http://localhost:9090   | Scrapes machine metrics                    |
+| Loadgen        | (compose service)       | Targets ~1.5K writes/s and ~10K reads/s    |
 
-**7-machine** Raft group (quorum 4). Node1 runs a light KV Put heartbeat
-(`demo/heartbeat` @ 1.5s) so commit indexes / applies/s keep moving.
+**7-machine** Raft group (quorum 4). Compose `loadgen` drives Put/Get traffic.
+Public reset is disabled (`ALLOW_RESET=false`).
 
 Local frontend hot reload (compose CP must be up):
 

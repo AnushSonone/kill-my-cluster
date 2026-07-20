@@ -1,0 +1,13 @@
+# Oracle / hosted overlay. Use with:
+#   docker compose -f docker-compose.yml -f docker-compose.oracle.yml up -d --build
+#
+# Public: control plane :8080, Grafana :3001
+# Private: Prometheus (no host port)
+# UI: anush.wiki/blog/raft (local Svelte web service disabled)
+
+services:
+  web:
+    profiles: ["local-ui"]
+
+  prometheus:
+    ports: !override []

@@ -53,14 +53,27 @@
       ]
     },
     {
-      "title": "Applies / sec (cluster throughput)",
+      "title": "Writes / sec (leader applies)",
       "type": "timeseries",
-      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 10 },
+      "gridPos": { "h": 10, "w": 6, "x": 12, "y": 10 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "sum(rate(kmc_kv_applies_total[15s]))",
-          "legendFormat": "applies/s",
+          "expr": "sum(rate(kmc_kv_writes_total[15s]) * on(node_id) group_left() kmc_raft_is_leader)",
+          "legendFormat": "writes/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Reads / sec (leader applies)",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 6, "x": 18, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(kmc_kv_reads_total[15s]) * on(node_id) group_left() kmc_raft_is_leader)",
+          "legendFormat": "reads/s",
           "refId": "A"
         }
       ]

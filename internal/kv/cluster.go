@@ -51,6 +51,8 @@ type Cluster struct {
 type Telemetry interface {
 	ObservePropose(d time.Duration)
 	IncApply()
+	IncWrite()
+	IncRead()
 }
 
 // Config bundles what NewCluster needs. It mirrors raft.Config but owns the
@@ -147,6 +149,12 @@ func (c *Cluster) handleApply(msg raft.ApplyMsg) {
 	res := c.machine.Apply(cmd)
 	if c.telemetry != nil {
 		c.telemetry.IncApply()
+		switch cmd.Op {
+		case OpGet:
+			c.telemetry.IncRead()
+		case OpPut, OpCAS:
+			c.telemetry.IncWrite()
+		}
 	}
 
 	c.waitMu.Lock()

@@ -12,13 +12,32 @@ import (
 
 // Server exposes the whitelist HTTP API (+ tiny kill UI).
 type Server struct {
-	engine *Engine
-	mux    *http.ServeMux
+	engine     *Engine
+	mux        *http.ServeMux
+	allowReset bool
+	cors       []string
+}
+
+// ServerOptions configures public API policy.
+type ServerOptions struct {
+	AllowReset bool
+	// CORSOrigins is a comma-separated allowlist (empty = no CORS headers).
+	CORSOrigins string
 }
 
 // NewServer builds routes around eng.
-func NewServer(eng *Engine) *Server {
-	s := &Server{engine: eng, mux: http.NewServeMux()}
+func NewServer(eng *Engine, opts ServerOptions) *Server {
+	s := &Server{
+		engine:     eng,
+		mux:        http.NewServeMux(),
+		allowReset: opts.AllowReset,
+	}
+	for _, o := range strings.Split(opts.CORSOrigins, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			s.cors = append(s.cors, o)
+		}
+	}
 	s.mux.HandleFunc("/", s.handleIndex)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/api/nodes", s.handleList)
@@ -28,8 +47,33 @@ func NewServer(eng *Engine) *Server {
 	return s
 }
 
-// Handler returns the root handler.
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the root handler with optional CORS.
+func (s *Server) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.applyCORS(w, r)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		s.mux.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) {
+	if len(s.cors) == 0 {
+		return
+	}
+	origin := r.Header.Get("Origin")
+	for _, allowed := range s.cors {
+		if origin == allowed || allowed == "*" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			return
+		}
+	}
+}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -62,6 +106,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	s.engine.AddViewer()
+	defer s.engine.RemoveViewer()
+
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	ctx := r.Context()
@@ -83,6 +130,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.allowReset {
+		http.Error(w, "reset disabled on public control plane", http.StatusForbidden)
 		return
 	}
 	if err := s.engine.ResetAll(r.Context()); err != nil {
@@ -166,10 +217,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // ListenAndServe is a convenience for cmd/controlplane.
-func ListenAndServe(addr string, eng *Engine) error {
+func ListenAndServe(addr string, eng *Engine, opts ServerOptions) error {
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           NewServer(eng).Handler(),
+		Handler:           NewServer(eng, opts).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	fmt.Printf("control plane listening on http://%s\n", addr)

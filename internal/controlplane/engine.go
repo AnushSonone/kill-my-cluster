@@ -38,6 +38,8 @@ type Engine struct {
 	dockerBin string
 	network   string // compose network name for partition (e.g. kmc_kmc)
 	nodes     map[uint64]Node
+	startedAt time.Time
+	rates     *RateCache
 
 	globalEvery time.Duration
 	globalMu    sync.Mutex
@@ -54,6 +56,9 @@ type Engine struct {
 	eventMu  sync.Mutex
 	events   []Event
 	eventCap int
+
+	viewersMu sync.Mutex
+	viewers   int
 }
 
 type healJob struct {
@@ -82,6 +87,8 @@ type Config struct {
 	IPCooldown        time.Duration
 	// HealAfter is how long a killed/partitioned machine stays down (default 10s).
 	HealAfter time.Duration
+	// Rates is optional Prometheus-backed write/read QPS.
+	Rates *RateCache
 }
 
 // NewEngine validates the whitelist. Docker connectivity is checked lazily.
@@ -119,6 +126,8 @@ func NewEngine(cfg Config) (*Engine, error) {
 		dockerBin:   bin,
 		network:     cfg.Network,
 		nodes:       nodes,
+		startedAt:   time.Now().UTC(),
+		rates:       cfg.Rates,
 		globalEvery: time.Duration(float64(time.Second) / rate),
 		ipCooldown:  ipCD,
 		ipLast:      make(map[string]time.Time),
@@ -126,6 +135,28 @@ func NewEngine(cfg Config) (*Engine, error) {
 		heals:       make(map[uint64]*healJob),
 		eventCap:    64,
 	}, nil
+}
+
+// AddViewer increments the live SSE presence count.
+func (e *Engine) AddViewer() {
+	e.viewersMu.Lock()
+	e.viewers++
+	e.viewersMu.Unlock()
+}
+
+// RemoveViewer decrements the live SSE presence count.
+func (e *Engine) RemoveViewer() {
+	e.viewersMu.Lock()
+	if e.viewers > 0 {
+		e.viewers--
+	}
+	e.viewersMu.Unlock()
+}
+
+func (e *Engine) activeUsers() int {
+	e.viewersMu.Lock()
+	defer e.viewersMu.Unlock()
+	return e.viewers
 }
 
 // Close cancels pending heal timers.
@@ -170,14 +201,18 @@ type Status struct {
 
 // Snapshot is the full cluster view for SSE/UI.
 type Snapshot struct {
-	Nodes       []Status  `json:"nodes"`
-	Alive       int       `json:"alive"`
-	Total       int       `json:"total"`
-	Quorum      bool      `json:"quorum"`
-	HealAfterMs int64     `json:"healAfterMs"`
-	LeaderID    uint64    `json:"leaderId,omitempty"`
-	Term        uint64    `json:"term,omitempty"`
-	Events []Event `json:"events"`
+	Nodes         []Status `json:"nodes"`
+	Alive         int      `json:"alive"`
+	Total         int      `json:"total"`
+	Quorum        bool     `json:"quorum"`
+	HealAfterMs   int64    `json:"healAfterMs"`
+	LeaderID      uint64   `json:"leaderId,omitempty"`
+	Term          uint64   `json:"term,omitempty"`
+	UptimeMs      int64    `json:"uptimeMs"`
+	ActiveUsers   int      `json:"activeUsers"`
+	WritesPerSec  float64  `json:"writesPerSec"`
+	ReadsPerSec   float64  `json:"readsPerSec"`
+	Events        []Event  `json:"events"`
 }
 
 // Snapshot builds the current cluster view.
@@ -199,15 +234,27 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 		}
 	}
 	total := len(list)
+	writes, reads := 0.0, 0.0
+	if e.rates != nil {
+		writes, reads = e.rates.Rates()
+	}
+	started := e.startedAt
+	if started.IsZero() {
+		started = time.Now().UTC()
+	}
 	return Snapshot{
-		Nodes:       list,
-		Alive:       alive,
-		Total:       total,
-		Quorum:      alive > total/2,
-		HealAfterMs: e.healAfter.Milliseconds(),
-		LeaderID:    leaderID,
-		Term:        term,
-		Events:      e.Events(),
+		Nodes:        list,
+		Alive:        alive,
+		Total:        total,
+		Quorum:       alive > total/2,
+		HealAfterMs:  e.healAfter.Milliseconds(),
+		LeaderID:     leaderID,
+		Term:         term,
+		UptimeMs:     time.Since(started).Milliseconds(),
+		ActiveUsers:  e.activeUsers(),
+		WritesPerSec: writes,
+		ReadsPerSec:  reads,
+		Events:       e.Events(),
 	}
 }
 

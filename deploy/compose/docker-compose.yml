@@ -1,8 +1,9 @@
 # 7-node local demo cluster + Prometheus + Grafana + control plane.
 # Kill UI:   http://localhost:8080
-# Grafana:   http://localhost:3000  (admin/admin)
+# Grafana:   http://localhost:3001  (admin/admin) — not :3000 (wiki owns that locally)
 # Prom:      http://localhost:9090
 # Graph UI:  http://localhost:5173  (Threlte/Three.js client-side; SVG fallback)
+# Loadgen:   ~1.5K writes/s + ~10K reads/s (see loadgen service)
 #
 # Auto-heal: control plane restarts/rejoins machines ~10s after kill/partition.
 #
@@ -27,9 +28,8 @@ services:
       METRICS_ADDR: 0.0.0.0:9100
       PEERS: 2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000,6=node6:7000,7=node7:7000
       KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
-      # Slow KV heartbeat so commit indexes keep moving (proof of life).
-      RUN_AGENT: "true"
-      AGENT_INTERVAL: "1500ms"
+      # Heartbeat off when loadgen is running (compose loadgen service).
+      RUN_AGENT: "false"
     volumes:
       - node1-data:/data
     networks: [kmc]
@@ -137,6 +137,21 @@ services:
     networks: [kmc]
     restart: unless-stopped
 
+  loadgen:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.loadgen
+    container_name: kmc-loadgen
+    environment:
+      KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
+      WRITE_QPS: "1500"
+      READ_QPS: "10000"
+      WRITE_WORKERS: "64"
+      READ_WORKERS: "128"
+    depends_on: [node1, node2, node3, node4, node5, node6, node7]
+    networks: [kmc]
+    restart: unless-stopped
+
   controlplane:
     build:
       context: ../..
@@ -147,13 +162,16 @@ services:
       CONTROL_NODES: 1=kmc-node-1,2=kmc-node-2,3=kmc-node-3,4=kmc-node-4,5=kmc-node-5,6=kmc-node-6,7=kmc-node-7
       CONTROL_NETWORK: kmc_kmc
       HEAL_AFTER: 10s
+      PROMETHEUS_URL: http://prometheus:9090
+      ALLOW_RESET: "false"
+      CORS_ORIGINS: https://anush.wiki,http://127.0.0.1:3000,http://localhost:3000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8080:8080"
     networks: [kmc]
     restart: unless-stopped
-    depends_on: [node1, node2, node3, node4, node5, node6, node7]
+    depends_on: [node1, node2, node3, node4, node5, node6, node7, prometheus]
   web:
     build: ../../web
     container_name: kmc-web
@@ -185,16 +203,16 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_USERS_DEFAULT_THEME: dark
-      # Allow embedding from the demo UI (localhost:5173 → :3000 iframe).
+      # Allow embedding from wiki / local UI (host Grafana on :3001).
       GF_SECURITY_ALLOW_EMBEDDING: "true"
       GF_SECURITY_COOKIE_SAMESITE: disabled
       GF_SECURITY_X_FRAME_OPTIONS: ""
+      GF_USERS_DEFAULT_THEME: light
     volumes:
       - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"
+      - "3001:3000"
     depends_on: [prometheus]
     networks: [kmc]
     restart: unless-stopped

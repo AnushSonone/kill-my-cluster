@@ -4,9 +4,13 @@
 //	CONTROL_NETWORK=kmc_kmc
 //	HEAL_AFTER=10s
 //	HTTP_ADDR=0.0.0.0:8080
+//	PROMETHEUS_URL=http://prometheus:9090
+//	ALLOW_RESET=false
+//	CORS_ORIGINS=https://anush.wiki,http://127.0.0.1:3000
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -25,12 +29,20 @@ func main() {
 	if err != nil {
 		fatalf("HEAL_AFTER: %v", err)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rates := controlplane.NewRateCache(env("PROMETHEUS_URL", ""))
+	go rates.Run(ctx)
+
 	eng, err := controlplane.NewEngine(controlplane.Config{
 		Nodes:             nodes,
 		Network:           env("CONTROL_NETWORK", "kmc_kmc"),
 		GlobalKillsPerSec: 1.5,
 		IPCooldown:        2 * time.Second,
 		HealAfter:         healAfter,
+		Rates:             rates,
 	})
 	if err != nil {
 		fatalf("%v", err)
@@ -38,9 +50,13 @@ func main() {
 	defer eng.Close()
 
 	addr := env("HTTP_ADDR", "0.0.0.0:8080")
-	fmt.Printf("whitelist: %d nodes · network=%s · heal=%s\n",
-		len(nodes), env("CONTROL_NETWORK", "kmc_kmc"), healAfter)
-	if err := controlplane.ListenAndServe(addr, eng); err != nil {
+	allowReset := strings.EqualFold(env("ALLOW_RESET", "false"), "true")
+	fmt.Printf("whitelist: %d nodes · network=%s · heal=%s · reset=%v\n",
+		len(nodes), env("CONTROL_NETWORK", "kmc_kmc"), healAfter, allowReset)
+	if err := controlplane.ListenAndServe(addr, eng, controlplane.ServerOptions{
+		AllowReset:  allowReset,
+		CORSOrigins: env("CORS_ORIGINS", ""),
+	}); err != nil {
 		fatalf("%v", err)
 	}
 }
