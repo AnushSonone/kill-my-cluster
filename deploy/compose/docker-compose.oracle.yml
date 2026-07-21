@@ -11,3 +11,10 @@ services:
 
   prometheus:
     ports: !override []
+
+  grafana:
+    environment:
+      GF_SERVER_ROOT_URL: https://raft-grafana.anush.wiki
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_SECURITY_COOKIE_SAMESITE: disabled
+      GF_SECURITY_X_FRAME_OPTIONS: ""

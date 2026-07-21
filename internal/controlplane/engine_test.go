@@ -1,31 +1,28 @@
 package controlplane
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestAllowDisruptRateLimits(t *testing.T) {
+func TestAllowDisruptPerIPCooldown(t *testing.T) {
 	e := &Engine{
-		nodes:       map[uint64]Node{1: {ID: 1, ContainerName: "n1"}},
-		globalEvery: 200 * time.Millisecond,
-		ipCooldown:  500 * time.Millisecond,
-		ipLast:      make(map[string]time.Time),
-		heals:       make(map[uint64]*healJob),
+		nodes:      map[uint64]Node{1: {ID: 1, ContainerName: "n1"}},
+		ipCooldown: 2 * time.Second,
+		ipLast:     make(map[string]time.Time),
+		heals:      make(map[uint64]*healJob),
 	}
-	if err := e.allowDisrupt("1.1.1.1"); err != nil {
+	ctx := context.Background()
+	if err := e.allowDisrupt(ctx, "1.1.1.1"); err != nil {
 		t.Fatalf("first kill: %v", err)
 	}
-	if err := e.allowDisrupt("1.1.1.1"); err == nil {
-		t.Fatal("expected per-IP or global limit")
+	if err := e.allowDisrupt(ctx, "1.1.1.1"); err == nil {
+		t.Fatal("expected per-IP cooldown")
 	}
-	if err := e.allowDisrupt("2.2.2.2"); err == nil {
-		t.Fatal("expected global rate limit")
-	}
-	time.Sleep(220 * time.Millisecond)
-	if err := e.allowDisrupt("2.2.2.2"); err != nil {
-		t.Fatalf("after global window: %v", err)
+	if err := e.allowDisrupt(ctx, "2.2.2.2"); err != nil {
+		t.Fatalf("other IP should be allowed: %v", err)
 	}
 }
 

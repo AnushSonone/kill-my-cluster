@@ -176,15 +176,15 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 	if err := s.engine.Do(r.Context(), ip, id, action); err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "rate limit") || strings.Contains(err.Error(), "cooldown") {
+		msg := err.Error()
+		if strings.Contains(msg, "rate limit") || strings.Contains(msg, "cooldown") {
 			code = http.StatusTooManyRequests
 		}
-		http.Error(w, err.Error(), code)
+		http.Error(w, msg, code)
 		return
 	}
 	writeJSON(w, map[string]any{
 		"ok": true, "id": id, "action": action,
-		"healAfterMs": s.engine.HealAfter().Milliseconds(),
 	})
 }
 

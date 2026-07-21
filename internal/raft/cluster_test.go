@@ -295,9 +295,9 @@ func TestLeaderFailover(t *testing.T) {
 	if newLeader == oldLeader {
 		t.Fatalf("same leader %d after kill", oldLeader)
 	}
-	t.Logf("failover: node %d → node %d in %v", oldLeader, newLeader, elapsed)
-	if elapsed > 800*time.Millisecond {
-		t.Fatalf("re-election took %v; want sub-second (~hundreds of ms)", elapsed)
+	t.Logf("failover: node %d -> node %d in %v", oldLeader, newLeader, elapsed)
+	if elapsed > 2*time.Second {
+		t.Fatalf("re-election took %v; want within ~2s (election timeout 750-1500ms)", elapsed)
 	}
 
 	c.proposeAll([]byte("after-kill"))

@@ -60,8 +60,10 @@ func (r *RateCache) Rates() (writes, reads float64) {
 
 func (r *RateCache) refresh(ctx context.Context) {
 	// Leader-only so follower applies do not multiply throughput by N.
-	w := r.query(ctx, `sum(rate(kmc_kv_writes_total[15s]) * on(node_id) group_left() kmc_raft_is_leader)`)
-	rd := r.query(ctx, `sum(rate(kmc_kv_reads_total[15s]) * on(node_id) group_left() kmc_raft_is_leader)`)
+	// Join on instance (scrape target), not node_id: duplicate node_id labels
+	// under kill/restart churn make on(node_id) many-to-many and return 0.
+	w := r.query(ctx, `sum(rate(kmc_kv_writes_total[15s]) and on(instance) (kmc_raft_is_leader == 1))`)
+	rd := r.query(ctx, `sum(rate(kmc_kv_reads_total[15s]) and on(instance) (kmc_raft_is_leader == 1))`)
 	r.mu.Lock()
 	r.writes = w
 	r.reads = rd

@@ -67,26 +67,27 @@ func (r Role) String() string {
 
 // Election/heartbeat timing.
 //
-// The constraint (§5.6) is: broadcastTime << electionTimeout << MTBF. Our
-// gRPC round-trips on localhost are well under a millisecond, so 150–300ms
-// election timeouts leave heaps of margin while still re-electing within a
-// few hundred ms of a leader death — the Phase 2 "done" criterion.
+// The constraint (§5.6) is: broadcastTime << electionTimeout << MTBF.
+// Under Docker compose + loadgen, scheduling jitter is much larger than bare
+// localhost RPC, so we use longer timeouts than the classic 150-300ms lab
+// values. That keeps the leader stable unless a machine is actually killed.
+// Re-election after a real kill still lands in about 1-2s.
 //
 // The timeout is RANDOMIZED per election within [min, max): if every follower
 // used the same timeout, they would all become candidates simultaneously,
 // split the vote, and repeat forever. Randomization makes one node's timer
 // usually fire first; it wins before the others even wake up.
 const (
-	electionTimeoutMin = 150 * time.Millisecond
-	electionTimeoutMax = 300 * time.Millisecond
+	electionTimeoutMin = 750 * time.Millisecond
+	electionTimeoutMax = 1500 * time.Millisecond
 
 	// The leader sends heartbeats at several times the election-timeout
 	// frequency so a single dropped heartbeat can't trigger a needless
 	// election.
-	heartbeatInterval = 50 * time.Millisecond
+	heartbeatInterval = 150 * time.Millisecond
 
 	// How often the election-timer goroutine wakes up to check the clock.
-	tickInterval = 10 * time.Millisecond
+	tickInterval = 25 * time.Millisecond
 )
 
 // ApplyMsg is delivered on the apply channel for every committed log entry

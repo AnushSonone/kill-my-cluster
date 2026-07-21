@@ -1,19 +1,63 @@
 # kill-my-cluster
 
-Custom Raft KV with a public proof: **seven machines**, kill one, watch election /
-catch-up and a **10s** auto-heal. Fullscreen Threlte 3D mesh + collapsible Grafana
-(leader, term, commit index, applies/s).
+Custom Raft KV with a public proof: **seven machines**, kill one, watch election and
+catch-up. Public UI: [anush.wiki/blog/raft](https://anush.wiki/blog/raft)
+(**come kill my cluster!**). No `demo.anush.wiki`.
+
+## How the system runs
+
+```mermaid
+flowchart LR
+  Visitor[Visitor browser]
+  Wiki[anush.wiki /blog/raft<br/>Vercel Next]
+  EdgeAPI[raft-api.anush.wiki<br/>Cloudflare Tunnel]
+  EdgeGraf[raft-grafana.anush.wiki<br/>Cloudflare Tunnel]
+  CF[cloudflared on Oracle]
+  CP[Control plane :8080]
+  Nodes[Raft nodes 1-7]
+  LG[loadgen]
+  Prom[Prometheus]
+  Graf[Grafana :3001]
+
+  Visitor --> Wiki
+  Wiki -->|same-origin /api/raft/*| EdgeAPI
+  Visitor -->|Grafana iframe| EdgeGraf
+  EdgeAPI --> CF
+  EdgeGraf --> CF
+  CF --> CP
+  CF --> Graf
+  CP -->|docker stop/start whitelist| Nodes
+  LG -->|Put/Get gRPC| Nodes
+  Nodes --> Prom
+  Prom --> Graf
+  Prom --> CP
+  CP -->|SSE snapshot| Wiki
+```
+
+| Layer | Role |
+|-------|------|
+| Wiki HUD | Kill buttons, live SSE (users, uptime, writes/s, reads/s, machines) |
+| Control plane | Whitelist Docker actions only; kill budget; silent auto-recover |
+| Raft + KV | 7-node quorum (need 4); Gets still go through the Raft log |
+| Loadgen | Steady background Put/Get (kept modest so leaders stay stable) |
+| Grafana | Embed at `raft-grafana.anush.wiki` |
+
+### Crowd-control defaults (control plane)
+
+| Rule | Value |
+|------|--------|
+| Per-IP kill cooldown | **2s** (same computer / IP) |
+| Public reset | **off** |
+| Recover delay | internal only (not advertised on the wiki) |
+
+Leaders should flip when a visitor kills a machine, not under idle load.
 
 ## Status
 
-- **Phase 1 — Storage engine (WAL + snapshots).** ← *done*
-- **Phase 2 — Raft consensus.** ← *done*
-- **Phase 3 — KV store + exactly-once.** ← *done*
-- **Phase 4 — Observability (Prometheus + Grafana).** ← *done*
-- **Docker cluster** — 7 machines + control plane + web. ← *done*
-- **Demo web UI** — fullscreen Threlte 3D (+ SVG `?view=svg`). ← *done*
-- Public UI: [anush.wiki/blog/raft](https://anush.wiki/blog/raft) (wiki). No `demo.anush.wiki`.
-- Hosted compose: Oracle VM + loadgen; see `migration_anush_wiki.md` and `deploy/oracle/README.md`.
+- Phases 1-4 (storage, Raft, KV, observability) done
+- Docker 7-node compose + loadgen + CP done
+- Public path: wiki → Cloudflare Tunnel → Oracle CP
+- Hosting notes: `migration_anush_wiki.md`, `deploy/oracle/README.md`
 
 ## Layout
 
@@ -23,8 +67,8 @@ internal/raft/         Raft consensus
 internal/kv/           replicated KV + remote Client
 internal/metrics/      Prometheus collectors (Raft / apply / writes / reads)
 internal/controlplane/ kill / partition / restart + SSE + presence/QPS
-cmd/node/              Docker node entrypoint (+ optional KV heartbeat agent)
-cmd/loadgen/           sustained Put/Get traffic (~1.5K / ~10K targets)
+cmd/node/              Docker node entrypoint
+cmd/loadgen/           sustained Put/Get traffic
 cmd/controlplane/      whitelist kill switch
 cmd/*demo/             phase demos (storage / raft / kv / metrics)
 deploy/observability/  Prometheus + Grafana only (host scrape)
@@ -68,29 +112,32 @@ docker compose up -d --build
 # docker compose -f docker-compose.yml -f docker-compose.oracle.yml up -d --build
 ```
 
-| Service        | URL                     | Notes                                      |
-|----------------|-------------------------|--------------------------------------------|
-| Public UI      | anush.wiki/blog/raft    | Wiki HUD + kill (proxies `/api/raft`)      |
-| Local web      | http://localhost:5173   | Optional Threlte UI                        |
-| Control plane  | http://localhost:8080   | Kill / partition / restart · heal ~10s · SSE |
-| Grafana        | http://localhost:3001   | `admin` / `admin` — leader/term/writes/reads |
-| Prometheus     | http://localhost:9090   | Scrapes machine metrics                    |
-| Loadgen        | (compose service)       | Targets ~1.5K writes/s and ~10K reads/s    |
+| Service        | URL                              | Notes                                      |
+|----------------|----------------------------------|--------------------------------------------|
+| Public UI      | anush.wiki/blog/raft             | Wiki HUD + kill (proxies `/api/raft`)      |
+| Local web      | http://localhost:5173            | Optional Threlte UI                        |
+| Control plane  | http://localhost:8080            | Kill / partition / restart · SSE           |
+| Grafana local  | http://localhost:3001            | `admin` / `admin`                          |
+| Grafana public | https://raft-grafana.anush.wiki  | Tunnel hostname (embed on wiki)            |
+| Prometheus     | http://localhost:9090            | Scrapes machine metrics (not public)       |
+| Loadgen        | (compose service)                | Modest QPS so the leader stays stable      |
 
-**7-machine** Raft group (quorum 4). Compose `loadgen` drives Put/Get traffic.
-Public reset is disabled (`ALLOW_RESET=false`).
-
-Local frontend hot reload (compose CP must be up):
+**7-machine** Raft group (quorum 4). Public reset is disabled (`ALLOW_RESET=false`).
 
 ```bash
-cd web && npm install && npm run dev
-# proxies /api → http://127.0.0.1:8080
-# force SVG: http://localhost:5173/?view=svg
-```
-
-```bash
-curl -X POST http://localhost:8080/api/nodes/1/kill      # heals ~10s
-curl -X POST http://localhost:8080/api/nodes/2/partition  # rejoins ~10s
-curl -X POST http://localhost:8080/api/reset
+curl -X POST http://localhost:8080/api/nodes/1/kill
+curl -X POST http://localhost:8080/api/nodes/2/partition
+curl -X POST http://localhost:8080/api/reset   # 403 when ALLOW_RESET=false
 docker compose down
 ```
+
+## Next: security hardening (after demo polish)
+
+Track in `migration_anush_wiki.md`. Intended follow-ups:
+
+1. OCI: confirm only SSH is public; app ports closed
+2. Cloudflare WAF / rate limit on kill POST (loose complement to CP)
+3. Tunnel ingress restricted to `/api/*` + `/healthz` (and Grafana path if kept)
+4. Rotate tunnel token if it ever landed in chat/logs
+5. Optional: separate Grafana credentials; drop anonymous admin on public embed
+6. Document incident steps (revoke tunnel, freeze compose)

@@ -59,7 +59,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "sum(rate(kmc_kv_writes_total[15s]) * on(node_id) group_left() kmc_raft_is_leader)",
+          "expr": "sum(rate(kmc_kv_writes_total[15s]) and on(instance) (kmc_raft_is_leader == 1))",
           "legendFormat": "writes/s",
           "refId": "A"
         }
@@ -72,7 +72,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "sum(rate(kmc_kv_reads_total[15s]) * on(node_id) group_left() kmc_raft_is_leader)",
+          "expr": "sum(rate(kmc_kv_reads_total[15s]) and on(instance) (kmc_raft_is_leader == 1))",
           "legendFormat": "reads/s",
           "refId": "A"
         }

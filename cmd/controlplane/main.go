@@ -37,12 +37,11 @@ func main() {
 	go rates.Run(ctx)
 
 	eng, err := controlplane.NewEngine(controlplane.Config{
-		Nodes:             nodes,
-		Network:           env("CONTROL_NETWORK", "kmc_kmc"),
-		GlobalKillsPerSec: 1.5,
-		IPCooldown:        2 * time.Second,
-		HealAfter:         healAfter,
-		Rates:             rates,
+		Nodes:      nodes,
+		Network:    env("CONTROL_NETWORK", "kmc_kmc"),
+		IPCooldown: 2 * time.Second,
+		HealAfter:  healAfter,
+		Rates:      rates,
 	})
 	if err != nil {
 		fatalf("%v", err)

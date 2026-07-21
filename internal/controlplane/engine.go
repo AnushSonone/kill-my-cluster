@@ -41,10 +41,7 @@ type Engine struct {
 	startedAt time.Time
 	rates     *RateCache
 
-	globalEvery time.Duration
-	globalMu    sync.Mutex
-	globalNext  time.Time
-
+	// Per-client kill cooldown (same browser/IP).
 	ipCooldown time.Duration
 	ipMu       sync.Mutex
 	ipLast     map[string]time.Time
@@ -83,9 +80,10 @@ type Config struct {
 	// Network is the Docker network used for partition (disconnect/connect).
 	Network string
 
-	GlobalKillsPerSec float64
-	IPCooldown        time.Duration
+	// IPCooldown between kills from the same client IP (default 2s).
+	IPCooldown time.Duration
 	// HealAfter is how long a killed/partitioned machine stays down (default 10s).
+	// Not advertised on the public wiki UI.
 	HealAfter time.Duration
 	// Rates is optional Prometheus-backed write/read QPS.
 	Rates *RateCache
@@ -110,10 +108,6 @@ func NewEngine(cfg Config) (*Engine, error) {
 		}
 		nodes[n.ID] = n
 	}
-	rate := cfg.GlobalKillsPerSec
-	if rate <= 0 {
-		rate = 1.5
-	}
 	ipCD := cfg.IPCooldown
 	if ipCD <= 0 {
 		ipCD = 2 * time.Second
@@ -123,17 +117,16 @@ func NewEngine(cfg Config) (*Engine, error) {
 		heal = 10 * time.Second
 	}
 	return &Engine{
-		dockerBin:   bin,
-		network:     cfg.Network,
-		nodes:       nodes,
-		startedAt:   time.Now().UTC(),
-		rates:       cfg.Rates,
-		globalEvery: time.Duration(float64(time.Second) / rate),
-		ipCooldown:  ipCD,
-		ipLast:      make(map[string]time.Time),
-		healAfter:   heal,
-		heals:       make(map[uint64]*healJob),
-		eventCap:    64,
+		dockerBin:  bin,
+		network:    cfg.Network,
+		nodes:      nodes,
+		startedAt:  time.Now().UTC(),
+		rates:      cfg.Rates,
+		ipCooldown: ipCD,
+		ipLast:     make(map[string]time.Time),
+		healAfter:  heal,
+		heals:      make(map[uint64]*healJob),
+		eventCap:   64,
 	}, nil
 }
 
@@ -287,7 +280,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 	}
 	switch action {
 	case ActionKill:
-		if err := e.allowDisrupt(clientIP); err != nil {
+		if err := e.allowDisrupt(ctx, clientIP); err != nil {
 			return err
 		}
 		e.cancelHeal(id)
@@ -295,7 +288,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if err := e.run(ctx, "stop", "-t", "1", n.ContainerName); err != nil {
 			return err
 		}
-		e.addEvent("kill", fmt.Sprintf("Machine %d killed — auto-heal in %s", id, e.healAfter))
+		e.addEvent("kill", fmt.Sprintf("Machine %d killed", id))
 		e.scheduleHeal(id, "start")
 		return nil
 
@@ -320,7 +313,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if e.network == "" {
 			return fmt.Errorf("controlplane: partition requires CONTROL_NETWORK")
 		}
-		if err := e.allowDisrupt(clientIP); err != nil {
+		if err := e.allowDisrupt(ctx, clientIP); err != nil {
 			return err
 		}
 		e.cancelHeal(id)
@@ -337,7 +330,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if err := e.run(ctx, "network", "disconnect", e.network, n.ContainerName); err != nil {
 			return err
 		}
-		e.addEvent("partition", fmt.Sprintf("Machine %d partitioned — reconnect in %s", id, e.healAfter))
+		e.addEvent("partition", fmt.Sprintf("Machine %d partitioned", id))
 		e.scheduleHeal(id, "reconnect")
 		return nil
 
@@ -365,7 +358,7 @@ func (e *Engine) ResetAll(ctx context.Context) error {
 			_ = e.connectNetwork(ctx, n.ContainerName)
 		}
 	}
-	e.addEvent("reset", "Reset all — every node started and rejoined the network")
+	e.addEvent("reset", "Reset all: every node started and rejoined the network")
 	if len(errs) > 0 {
 		return fmt.Errorf("controlplane: reset partial failures: %s", strings.Join(errs, "; "))
 	}
@@ -578,18 +571,8 @@ func (e *Engine) output(ctx context.Context, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-func (e *Engine) allowDisrupt(clientIP string) error {
+func (e *Engine) allowDisrupt(_ context.Context, clientIP string) error {
 	now := time.Now()
-
-	e.globalMu.Lock()
-	if now.Before(e.globalNext) {
-		wait := e.globalNext.Sub(now)
-		e.globalMu.Unlock()
-		return fmt.Errorf("controlplane: global kill rate limit — retry in %dms", wait.Milliseconds())
-	}
-	e.globalNext = now.Add(e.globalEvery)
-	e.globalMu.Unlock()
-
 	if clientIP == "" {
 		clientIP = "unknown"
 	}
@@ -597,7 +580,7 @@ func (e *Engine) allowDisrupt(clientIP string) error {
 	defer e.ipMu.Unlock()
 	if last, ok := e.ipLast[clientIP]; ok {
 		if wait := e.ipCooldown - now.Sub(last); wait > 0 {
-			return fmt.Errorf("controlplane: per-IP cooldown — retry in %dms", wait.Milliseconds())
+			return fmt.Errorf("controlplane: per-IP cooldown - retry in %dms", wait.Milliseconds())
 		}
 	}
 	e.ipLast[clientIP] = now
