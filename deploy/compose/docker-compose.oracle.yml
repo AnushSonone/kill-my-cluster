@@ -9,6 +9,15 @@ services:
   web:
     profiles: ["local-ui"]
 
+  # Oracle ladder 2026-07-21: peak sustained ~1413w/3233r (C5) with term flat
+  # on 4 OCPU. Promote below peak for kill-headroom.
+  loadgen:
+    environment:
+      WRITE_QPS: "1400"
+      READ_QPS: "3000"
+      WRITE_WORKERS: "64"
+      READ_WORKERS: "128"
+
   prometheus:
     ports: !override []
 
