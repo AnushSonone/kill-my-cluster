@@ -200,14 +200,14 @@ type Status struct {
 
 // Snapshot is the full cluster view for SSE/UI.
 type Snapshot struct {
-	Nodes         []Status `json:"nodes"`
-	Alive         int      `json:"alive"`
-	Total         int      `json:"total"`
-	Quorum        bool     `json:"quorum"`
-	HealAfterMs   int64    `json:"healAfterMs"`
-	LeaderID      uint64   `json:"leaderId,omitempty"`
-	Term          uint64   `json:"term,omitempty"`
-	UptimeMs      int64    `json:"uptimeMs"`
+	Nodes       []Status `json:"nodes"`
+	Alive       int      `json:"alive"`
+	Total       int      `json:"total"`
+	Quorum      bool     `json:"quorum"`
+	HealAfterMs int64    `json:"healAfterMs"`
+	LeaderID    uint64   `json:"leaderId,omitempty"`
+	Term        uint64   `json:"term,omitempty"`
+	UptimeMs    int64    `json:"uptimeMs"`
 	// SinceLastQuorumLossMs is ms since quorum last dropped false.
 	// -1 means never lost quorum since this control-plane process started.
 	// While quorum is currently false, this is age of the ongoing loss.
@@ -215,7 +215,11 @@ type Snapshot struct {
 	ActiveUsers           int     `json:"activeUsers"`
 	WritesPerSec          float64 `json:"writesPerSec"`
 	ReadsPerSec           float64 `json:"readsPerSec"`
-	Events                []Event `json:"events"`
+	// Host* are VM-level (node_exporter). Omitted when Prom/exporter unavailable.
+	HostCpuBusyPct    *float64 `json:"hostCpuBusyPct,omitempty"`
+	HostMemUsedBytes  *float64 `json:"hostMemUsedBytes,omitempty"`
+	HostMemTotalBytes *float64 `json:"hostMemTotalBytes,omitempty"`
+	Events            []Event  `json:"events"`
 }
 
 // Snapshot builds the current cluster view.
@@ -243,6 +247,15 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 	if e.rates != nil {
 		writes, reads = e.rates.Rates()
 	}
+	var hostCPU, hostMemUsed, hostMemTotal *float64
+	if e.rates != nil {
+		cpu, used, total, ok := e.rates.Host()
+		if ok {
+			hostCPU = &cpu
+			hostMemUsed = &used
+			hostMemTotal = &total
+		}
+	}
 	started := e.startedAt
 	if started.IsZero() {
 		started = time.Now().UTC()
@@ -260,6 +273,9 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 		ActiveUsers:           e.activeUsers(),
 		WritesPerSec:          writes,
 		ReadsPerSec:           reads,
+		HostCpuBusyPct:        hostCPU,
+		HostMemUsedBytes:      hostMemUsed,
+		HostMemTotalBytes:     hostMemTotal,
 		Events:                e.Events(),
 	}
 }

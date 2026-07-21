@@ -187,6 +187,25 @@ services:
     networks: [kmc]
     restart: unless-stopped
 
+  # Host (VM) CPU/memory for HUD + Grafana. Scrapes the Linux VM under Docker
+  # (Oracle host, or Docker Desktop's Linux VM locally). No public port.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: kmc-node-exporter
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/rootfs
+      - --web.listen-address=:9100
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containerd/.+)($|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/rootfs:ro
+    networks: [kmc]
+    restart: unless-stopped
+    pid: host
+
   prometheus:
     image: prom/prometheus:v3.2.1
     container_name: kmc-prometheus
@@ -196,6 +215,7 @@ services:
       - "9090:9090"
     networks: [kmc]
     restart: unless-stopped
+    depends_on: [node-exporter]
 
   grafana:
     image: grafana/grafana:11.5.2
