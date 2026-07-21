@@ -56,6 +56,12 @@ type Engine struct {
 
 	viewersMu sync.Mutex
 	viewers   int
+
+	// Quorum edge tracking for HUD "time since last quorum loss".
+	quorumMu         sync.Mutex
+	sawQuorum        bool // true after first successful quorum observation
+	lastHadQuorum    bool
+	lastQuorumLossAt time.Time // zero => never lost quorum since CP start
 }
 
 type healJob struct {
@@ -202,10 +208,14 @@ type Snapshot struct {
 	LeaderID      uint64   `json:"leaderId,omitempty"`
 	Term          uint64   `json:"term,omitempty"`
 	UptimeMs      int64    `json:"uptimeMs"`
-	ActiveUsers   int      `json:"activeUsers"`
-	WritesPerSec  float64  `json:"writesPerSec"`
-	ReadsPerSec   float64  `json:"readsPerSec"`
-	Events        []Event  `json:"events"`
+	// SinceLastQuorumLossMs is ms since quorum last dropped false.
+	// -1 means never lost quorum since this control-plane process started.
+	// While quorum is currently false, this is age of the ongoing loss.
+	SinceLastQuorumLossMs int64   `json:"sinceLastQuorumLossMs"`
+	ActiveUsers           int     `json:"activeUsers"`
+	WritesPerSec          float64 `json:"writesPerSec"`
+	ReadsPerSec           float64 `json:"readsPerSec"`
+	Events                []Event `json:"events"`
 }
 
 // Snapshot builds the current cluster view.
@@ -227,6 +237,8 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 		}
 	}
 	total := len(list)
+	quorum := alive > total/2
+	sinceLoss := e.noteQuorum(quorum)
 	writes, reads := 0.0, 0.0
 	if e.rates != nil {
 		writes, reads = e.rates.Rates()
@@ -236,19 +248,43 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 		started = time.Now().UTC()
 	}
 	return Snapshot{
-		Nodes:        list,
-		Alive:        alive,
-		Total:        total,
-		Quorum:       alive > total/2,
-		HealAfterMs:  e.healAfter.Milliseconds(),
-		LeaderID:     leaderID,
-		Term:         term,
-		UptimeMs:     time.Since(started).Milliseconds(),
-		ActiveUsers:  e.activeUsers(),
-		WritesPerSec: writes,
-		ReadsPerSec:  reads,
-		Events:       e.Events(),
+		Nodes:                 list,
+		Alive:                 alive,
+		Total:                 total,
+		Quorum:                quorum,
+		HealAfterMs:           e.healAfter.Milliseconds(),
+		LeaderID:              leaderID,
+		Term:                  term,
+		UptimeMs:              time.Since(started).Milliseconds(),
+		SinceLastQuorumLossMs: sinceLoss,
+		ActiveUsers:           e.activeUsers(),
+		WritesPerSec:          writes,
+		ReadsPerSec:           reads,
+		Events:                e.Events(),
 	}
+}
+
+// noteQuorum records quorum true→false edges. Returns ms since last loss, or -1 if never.
+func (e *Engine) noteQuorum(quorum bool) int64 {
+	e.quorumMu.Lock()
+	defer e.quorumMu.Unlock()
+	now := time.Now()
+	if !e.sawQuorum {
+		e.sawQuorum = true
+		e.lastHadQuorum = quorum
+		if !quorum {
+			e.lastQuorumLossAt = now
+		}
+	} else if e.lastHadQuorum && !quorum {
+		e.lastQuorumLossAt = now
+		e.lastHadQuorum = false
+	} else if quorum {
+		e.lastHadQuorum = true
+	}
+	if e.lastQuorumLossAt.IsZero() {
+		return -1
+	}
+	return now.Sub(e.lastQuorumLossAt).Milliseconds()
 }
 
 // List reports running/exited for every whitelisted machine.

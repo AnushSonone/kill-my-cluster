@@ -70,3 +70,32 @@ func TestPartitionRequiresNetwork(t *testing.T) {
 		t.Fatalf("expected network required error, got %v", err)
 	}
 }
+
+func TestNoteQuorumTracksTimeSinceLoss(t *testing.T) {
+	e := &Engine{}
+	if got := e.noteQuorum(true); got != -1 {
+		t.Fatalf("never lost: want -1, got %d", got)
+	}
+	if got := e.noteQuorum(true); got != -1 {
+		t.Fatalf("still never lost: want -1, got %d", got)
+	}
+	if got := e.noteQuorum(false); got < 0 {
+		t.Fatalf("on loss: want >=0, got %d", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+	mid := e.noteQuorum(false)
+	if mid < 15 {
+		t.Fatalf("during loss: want age >=15ms, got %d", mid)
+	}
+	time.Sleep(20 * time.Millisecond)
+	after := e.noteQuorum(true)
+	if after < mid {
+		t.Fatalf("after recover: timer should keep advancing, got %d < %d", after, mid)
+	}
+	// Next true→false edge resets the clock.
+	_ = e.noteQuorum(true)
+	_ = e.noteQuorum(false)
+	if got := e.noteQuorum(false); got > 50 {
+		t.Fatalf("fresh loss should reset clock, got %d", got)
+	}
+}
