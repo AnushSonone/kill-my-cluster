@@ -30,6 +30,7 @@ type Collector struct {
 	writesTotal    prometheus.Counter
 	readsTotal     prometheus.Counter
 	proposeLatency prometheus.Histogram
+	readLatency    prometheus.Histogram
 }
 
 // NewCollector registers series for the given node ID.
@@ -73,7 +74,7 @@ func NewCollector(nodeID uint64) *Collector {
 	})
 	c.appliesTotal = factory.NewCounter(prometheus.CounterOpts{
 		Name:        "kmc_kv_applies_total",
-		Help:        "Committed commands applied to the KV state machine",
+		Help:        "Committed mutating commands applied to the KV state machine",
 		ConstLabels: labels,
 	})
 	c.writesTotal = factory.NewCounter(prometheus.CounterOpts{
@@ -83,7 +84,7 @@ func NewCollector(nodeID uint64) *Collector {
 	})
 	c.readsTotal = factory.NewCounter(prometheus.CounterOpts{
 		Name:        "kmc_kv_reads_total",
-		Help:        "Committed Get commands applied to the KV state machine",
+		Help:        "Linearizable ReadIndex Gets served from local state",
 		ConstLabels: labels,
 	})
 	c.proposeLatency = factory.NewHistogram(prometheus.HistogramOpts{
@@ -91,6 +92,12 @@ func NewCollector(nodeID uint64) *Collector {
 		Help:        "Time from Propose to local apply (linearizable write latency)",
 		ConstLabels: labels,
 		Buckets:     []float64{.001, .002, .005, .01, .025, .05, .1, .25, .5, 1, 2.5},
+	})
+	c.readLatency = factory.NewHistogram(prometheus.HistogramOpts{
+		Name:        "kmc_read_latency_seconds",
+		Help:        "Time for a linearizable ReadIndex Get",
+		ConstLabels: labels,
+		Buckets:     []float64{.0001, .00025, .0005, .001, .002, .005, .01, .025, .05, .1},
 	})
 
 	return c
@@ -126,8 +133,13 @@ func (c *Collector) IncApply() { c.appliesTotal.Inc() }
 // IncWrite increments the Put/CAS counter.
 func (c *Collector) IncWrite() { c.writesTotal.Inc() }
 
-// IncRead increments the Get counter.
+// IncRead increments the linearizable-read counter.
 func (c *Collector) IncRead() { c.readsTotal.Inc() }
+
+// ObserveRead records one completed ReadIndex Get.
+func (c *Collector) ObserveRead(d time.Duration) {
+	c.readLatency.Observe(d.Seconds())
+}
 
 // RoleInt maps raft.Role string values to the gauge encoding.
 func RoleInt(role string) int {

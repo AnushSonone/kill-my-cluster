@@ -160,8 +160,43 @@ type Node struct {
 	// applier must hand to the state machine before any further entries.
 	pendingSnapshot *ApplyMsg
 
+	// propCh batches concurrent Propose calls so many entries share one WAL
+	// fsync (group commit).
+	propCh chan propReq
+	// readCh batches ReadIndex confirmations so many linearizable local reads
+	// share one majority heartbeat.
+	readCh chan readReq
+	// done is closed on Stop; batchers exit and Propose/ReadIndex fail fast.
+	done chan struct{}
+	// readLeaseUntil is when the leader may serve ReadIndex without a fresh
+	// majority heartbeat (refreshed after each successful confirm).
+	readLeaseUntil time.Time
+
 	stopped bool
 	wg      sync.WaitGroup
+}
+
+// propReq is one client Propose waiting for a group-committed log slot.
+type propReq struct {
+	data []byte
+	ch   chan propResult
+}
+
+type propResult struct {
+	index    uint64
+	term     uint64
+	isLeader bool
+}
+
+// readReq is one ReadIndex waiter (linearizable local-read barrier).
+type readReq struct {
+	ctx context.Context
+	ch  chan readResult
+}
+
+type readResult struct {
+	index uint64
+	ok    bool
 }
 
 // Config bundles what a Node needs at startup.
@@ -214,9 +249,15 @@ func NewNode(cfg Config) (*Node, error) {
 
 	n.resetElectionTimerLocked()
 
-	n.wg.Add(2)
+	n.propCh = make(chan propReq, 1024)
+	n.readCh = make(chan readReq, 1024)
+	n.done = make(chan struct{})
+
+	n.wg.Add(4)
 	go n.runElectionTimer()
 	go n.runApplier()
+	go n.runProposeBatcher()
+	go n.runReadIndexBatcher()
 	return n, nil
 }
 
@@ -230,6 +271,7 @@ func (n *Node) Stop() {
 	}
 	n.stopped = true
 	n.applyCond.Broadcast() // wake the applier so it can observe stopped
+	close(n.done)
 	n.mu.Unlock()
 
 	n.wg.Wait()
@@ -275,35 +317,103 @@ func (n *Node) CommitIndex() uint64 {
 
 // Propose asks the cluster to commit data. Only the leader accepts proposals;
 // followers return isLeader=false and the caller must retry against the
-// leader. On success it returns the log position the command will occupy IF
-// it commits — commitment is confirmed later, when the entry arrives on the
-// apply channel. (This two-step contract is inherent to consensus: acceptance
-// is immediate, durability across the cluster takes a round-trip.)
+// leader. Concurrent Proposes are group-committed: many entries share one
+// WAL fsync before replication.
+//
+// On success it returns the log position the command will occupy IF it
+// commits — commitment is confirmed later, when the entry arrives on the
+// apply channel.
 func (n *Node) Propose(data []byte) (index uint64, term uint64, isLeader bool) {
-	n.mu.Lock()
-	if n.role != Leader {
-		n.mu.Unlock()
+	ch := make(chan propResult, 1)
+	req := propReq{data: data, ch: ch}
+
+	select {
+	case <-n.done:
 		return 0, 0, false
+	case n.propCh <- req:
 	}
 
-	index = n.log.lastIndex() + 1
-	term = n.currentTerm
-	entry := &raftpb.LogEntry{Index: index, Term: term, Data: data}
-	n.log.append(entry)
-	// Durable on the leader BEFORE we replicate: the leader is one of the
-	// majority that must hold the entry, and its own disk is its vote.
-	if err := n.persist.appendEntries([]*raftpb.LogEntry{entry}); err != nil {
-		// A leader that cannot write its own log cannot honor its promises.
-		// Failing the proposal is the only safe answer.
-		n.mu.Unlock()
+	select {
+	case <-n.done:
 		return 0, 0, false
+	case res := <-ch:
+		return res.index, res.term, res.isLeader
+	}
+}
+
+// LastApplied returns the highest index delivered to the apply channel.
+func (n *Node) LastApplied() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastApplied
+}
+
+// ReadIndex confirms leadership (majority heartbeat) and returns the commit
+// index that must be applied before a linearizable local read is safe.
+// Concurrent callers share one confirmation round (batched). While a read
+// lease is held, callers bypass the batcher and run in parallel.
+func (n *Node) ReadIndex(ctx context.Context) (readIndex uint64, ok bool) {
+	n.mu.Lock()
+	if n.role == Leader && time.Now().Before(n.readLeaseUntil) {
+		idx := n.commitIndex
+		n.mu.Unlock()
+		if n.WaitApplied(ctx, idx) {
+			return idx, true
+		}
+		return 0, false
 	}
 	n.mu.Unlock()
 
-	// Push to followers immediately rather than waiting for the next
-	// heartbeat tick — this is what makes commit latency ~1 RTT.
-	n.broadcastAppendEntries()
-	return index, term, true
+	ch := make(chan readResult, 1)
+	req := readReq{ctx: ctx, ch: ch}
+
+	select {
+	case <-n.done:
+		return 0, false
+	case <-ctx.Done():
+		return 0, false
+	case n.readCh <- req:
+	}
+
+	select {
+	case <-n.done:
+		return 0, false
+	case <-ctx.Done():
+		return 0, false
+	case res := <-ch:
+		return res.index, res.ok
+	}
+}
+
+// WaitApplied blocks until lastApplied >= index, ctx cancels, or the node stops.
+func (n *Node) WaitApplied(ctx context.Context, index uint64) bool {
+	n.mu.Lock()
+	if n.lastApplied >= index {
+		n.mu.Unlock()
+		return true
+	}
+	n.mu.Unlock()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		n.mu.Lock()
+		ok := !n.stopped && n.lastApplied >= index
+		stopped := n.stopped
+		n.mu.Unlock()
+		if ok {
+			return true
+		}
+		if stopped || ctx.Err() != nil || time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-n.done:
+			return false
+		case <-time.After(200 * time.Microsecond):
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +530,7 @@ func (n *Node) becomeFollowerLocked(term uint64) {
 	n.currentTerm = term
 	n.role = Follower
 	n.votedFor = noVote
+	n.readLeaseUntil = time.Time{}
 	// Persist: forgetting this term after a crash would let us double-vote.
 	_ = n.persist.saveHardState(n.currentTerm, n.votedFor)
 	n.resetElectionTimerLocked()
@@ -446,6 +557,9 @@ func (n *Node) becomeLeaderLocked() {
 	go n.broadcastAppendEntries()
 
 	// And keep the heartbeat drumbeat going for as long as we lead.
+	// Clear any prior read lease — leadership is new.
+	n.readLeaseUntil = time.Time{}
+
 	n.wg.Add(1)
 	go n.runHeartbeats()
 }

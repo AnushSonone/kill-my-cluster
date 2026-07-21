@@ -26,6 +26,11 @@ import (
 	"github.com/AnushSonone/kill-my-cluster/internal/raftpb"
 )
 
+const (
+	// Cap AppendEntries payload so catch-up cannot stall heartbeats under load.
+	maxAppendEntries = 64
+)
+
 // runHeartbeats sends AppendEntries to every follower on a fixed interval for
 // as long as this node remains leader of the term it was elected in. Started
 // by becomeLeaderLocked; exits on step-down or shutdown.
@@ -100,12 +105,16 @@ func (n *Node) replicateToPeer(peer uint64, term uint64) {
 	prevIdx := next - 1
 	prevTerm, _ := n.log.term(prevIdx)
 
+	entries := n.log.suffix(next)
+	if len(entries) > maxAppendEntries {
+		entries = entries[:maxAppendEntries]
+	}
 	req := &raftpb.AppendEntriesRequest{
 		Term:         term,
 		LeaderId:     n.id,
 		PrevLogIndex: prevIdx,
 		PrevLogTerm:  prevTerm,
-		Entries:      n.log.suffix(next),
+		Entries:      entries,
 		LeaderCommit: n.commitIndex,
 	}
 	n.mu.Unlock()

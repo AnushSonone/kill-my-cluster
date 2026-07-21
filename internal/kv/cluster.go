@@ -36,8 +36,11 @@ type Cluster struct {
 	applyCh chan raft.ApplyMsg
 
 	// waiters maps log index → channel receiving the apply result for that entry.
+	// recent keeps results that applied before the proposer registered a waiter
+	// (common under propose batching when commit is fast).
 	waitMu  sync.Mutex
 	waiters map[uint64]chan ApplyResult
+	recent  map[uint64]ApplyResult
 
 	// telemetry is optional; set via SetTelemetry for Prometheus.
 	telemetry Telemetry
@@ -50,6 +53,7 @@ type Cluster struct {
 // Telemetry is the optional metrics sink (implemented by internal/metrics).
 type Telemetry interface {
 	ObservePropose(d time.Duration)
+	ObserveRead(d time.Duration)
 	IncApply()
 	IncWrite()
 	IncRead()
@@ -81,6 +85,7 @@ func NewCluster(cfg Config) (*Cluster, error) {
 		machine: NewMachine(),
 		applyCh: ch,
 		waiters: make(map[uint64]chan ApplyResult),
+		recent:  make(map[uint64]ApplyResult),
 		stop:    make(chan struct{}),
 	}
 	c.wg.Add(1)
@@ -150,8 +155,6 @@ func (c *Cluster) handleApply(msg raft.ApplyMsg) {
 	if c.telemetry != nil {
 		c.telemetry.IncApply()
 		switch cmd.Op {
-		case OpGet:
-			c.telemetry.IncRead()
 		case OpPut, OpCAS:
 			c.telemetry.IncWrite()
 		}
@@ -163,6 +166,13 @@ func (c *Cluster) handleApply(msg raft.ApplyMsg) {
 		c.waitMu.Unlock()
 		ch <- res
 		return
+	}
+	c.recent[msg.CommandIndex] = res
+	// Bound memory: drop results far behind the applied index.
+	for idx := range c.recent {
+		if idx+256 < msg.CommandIndex {
+			delete(c.recent, idx)
+		}
 	}
 	c.waitMu.Unlock()
 }
@@ -184,6 +194,14 @@ func (c *Cluster) propose(ctx context.Context, cmd Command) (ApplyResult, error)
 
 		ch := make(chan ApplyResult, 1)
 		c.waitMu.Lock()
+		if res, ready := c.recent[index]; ready {
+			delete(c.recent, index)
+			c.waitMu.Unlock()
+			if c.telemetry != nil {
+				c.telemetry.ObservePropose(time.Since(start))
+			}
+			return res, nil
+		}
 		c.waiters[index] = ch
 		c.waitMu.Unlock()
 
@@ -203,17 +221,35 @@ func (c *Cluster) propose(ctx context.Context, cmd Command) (ApplyResult, error)
 			// mid-flight; retry propose on a (possibly new) leader.
 			c.waitMu.Lock()
 			delete(c.waiters, index)
+			if res, ready := c.recent[index]; ready {
+				delete(c.recent, index)
+				c.waitMu.Unlock()
+				if c.telemetry != nil {
+					c.telemetry.ObservePropose(time.Since(start))
+				}
+				return res, nil
+			}
 			c.waitMu.Unlock()
 			start = time.Now()
 		}
 	}
 }
 
-// Get performs a linearizable read via the Raft log.
+// Get performs a linearizable read via Raft ReadIndex (not a log entry).
+// The leader confirms leadership with a majority heartbeat, waits until the
+// commit index is applied locally, then serves from the in-memory machine.
 func (c *Cluster) Get(ctx context.Context, clientID string, requestID uint64, key string) (ApplyResult, error) {
-	return c.propose(ctx, Command{
-		Op: OpGet, ClientID: clientID, RequestID: requestID, Key: key,
-	})
+	start := time.Now()
+	if _, ok := c.raft.ReadIndex(ctx); !ok {
+		return ApplyResult{}, ErrNotLeader
+	}
+	v, found := c.machine.Get(key)
+	if c.telemetry != nil {
+		c.telemetry.IncRead()
+		c.telemetry.ObserveRead(time.Since(start))
+	}
+	_, _ = clientID, requestID
+	return ApplyResult{Found: found, Value: v}, nil
 }
 
 // Put unconditionally sets key to value.

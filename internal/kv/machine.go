@@ -142,8 +142,8 @@ func (m *Machine) Apply(cmd Command) ApplyResult {
 	return res
 }
 
-// Get reads key from local state without going through Raft. Used only for
-// tests and internal diagnostics — client reads must use Cluster.Get (linearizable).
+// Get reads key from local state without going through Raft. Used by
+// Cluster.Get after a ReadIndex barrier, and by tests/diagnostics.
 func (m *Machine) Get(key string) ([]byte, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

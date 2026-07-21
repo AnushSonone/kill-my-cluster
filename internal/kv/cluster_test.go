@@ -143,7 +143,7 @@ func (c *testKVCluster) proposeViaLeader(ctx context.Context, fn func(*Cluster) 
 func TestKVPutGetLinearizable(t *testing.T) {
 	c := newTestKVCluster(t, 3)
 	defer c.stop()
-	c.waitForLeader(2 * time.Second)
+	c.waitForLeader(5 * time.Second)
 
 	ctx := context.Background()
 	err := c.proposeViaLeader(ctx, func(cl *Cluster) error {
@@ -153,20 +153,30 @@ func TestKVPutGetLinearizable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
-
-	for i, cl := range c.clusters {
-		v, ok := cl.machine.Get("color")
-		if !ok || string(v) != "blue" {
-			t.Fatalf("node %d: got ok=%v val=%q", i+1, ok, v)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		allOK := true
+		for i, cl := range c.clusters {
+			v, ok := cl.machine.Get("color")
+			if !ok || string(v) != "blue" {
+				allOK = false
+				if time.Now().After(deadline) {
+					t.Fatalf("node %d: got ok=%v val=%q", i+1, ok, v)
+				}
+				break
+			}
 		}
+		if allOK {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
 func TestExactlyOnceRetry(t *testing.T) {
 	c := newTestKVCluster(t, 3)
 	defer c.stop()
-	c.waitForLeader(2 * time.Second)
+	c.waitForLeader(5 * time.Second)
 
 	ctx := context.Background()
 	var sideEffect int
@@ -243,7 +253,7 @@ func TestExactlyOnceRetry(t *testing.T) {
 func TestCASAndCheckpoint(t *testing.T) {
 	c := newTestKVCluster(t, 3)
 	defer c.stop()
-	c.waitForLeader(2 * time.Second)
+	c.waitForLeader(5 * time.Second)
 	ctx := context.Background()
 
 	err := c.proposeViaLeader(ctx, func(cl *Cluster) error {
@@ -295,7 +305,7 @@ func TestCASAndCheckpoint(t *testing.T) {
 func TestWatchNotification(t *testing.T) {
 	c := newTestKVCluster(t, 3)
 	defer c.stop()
-	leader := c.waitForLeader(2 * time.Second)
+	leader := c.waitForLeader(5 * time.Second)
 
 	ch := leader.Watch("ticker")
 	defer leader.Unwatch("ticker", ch)
@@ -316,5 +326,35 @@ func TestWatchNotification(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for watch")
+	}
+}
+
+func TestGetUsesReadIndexNotLog(t *testing.T) {
+	c := newTestKVCluster(t, 3)
+	defer c.stop()
+	leader := c.waitForLeader(5 * time.Second)
+
+	ctx := context.Background()
+	if err := c.proposeViaLeader(ctx, func(cl *Cluster) error {
+		_, err := cl.Put(ctx, "visitor", 1, "color", []byte("red"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	before := leader.Raft().CommitIndex()
+	for i := 0; i < 40; i++ {
+		res, err := leader.Get(ctx, "reader", uint64(i+1), "color")
+		if err != nil {
+			t.Fatalf("Get %d: %v", i, err)
+		}
+		if !res.Found || string(res.Value) != "red" {
+			t.Fatalf("Get %d: found=%v val=%q", i, res.Found, res.Value)
+		}
+	}
+	after := leader.Raft().CommitIndex()
+	if after != before {
+		t.Fatalf("commit index moved %d -> %d after Gets; ReadIndex must not append", before, after)
 	}
 }

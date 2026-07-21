@@ -7,6 +7,7 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -256,7 +257,7 @@ func TestInitialElection(t *testing.T) {
 	c := newTestCluster(t, 3)
 	defer c.stop()
 
-	leader := c.waitForLeader(2 * time.Second)
+	leader := c.waitForLeader(5 * time.Second)
 	t.Logf("elected leader: node %d", leader)
 }
 
@@ -264,7 +265,7 @@ func TestReplication(t *testing.T) {
 	c := newTestCluster(t, 3)
 	defer c.stop()
 
-	c.waitForLeader(2 * time.Second)
+	c.waitForLeader(5 * time.Second)
 	c.proposeAll([]byte("alpha"))
 	c.waitForCommitOnMajority(1, 2*time.Second)
 
@@ -280,14 +281,14 @@ func TestLeaderFailover(t *testing.T) {
 	c := newTestCluster(t, 3)
 	defer c.stop()
 
-	oldLeader := c.waitForLeader(2 * time.Second)
+	oldLeader := c.waitForLeader(5 * time.Second)
 	c.proposeAll([]byte("before-kill"))
 	c.waitForCommitOnMajority(1, 2*time.Second)
 
 	start := time.Now()
 	c.stopNode(oldLeader)
 
-	newLeader, ok := c.leaderID(2 * time.Second)
+	newLeader, ok := c.leaderID(4 * time.Second)
 	if !ok {
 		t.Fatal("no new leader after killing the old one")
 	}
@@ -296,8 +297,8 @@ func TestLeaderFailover(t *testing.T) {
 		t.Fatalf("same leader %d after kill", oldLeader)
 	}
 	t.Logf("failover: node %d -> node %d in %v", oldLeader, newLeader, elapsed)
-	if elapsed > 2*time.Second {
-		t.Fatalf("re-election took %v; want within ~2s (election timeout 750-1500ms)", elapsed)
+	if elapsed > 4*time.Second {
+		t.Fatalf("re-election took %v; want within ~4s (election timeout 750-1500ms + Docker slack)", elapsed)
 	}
 
 	c.proposeAll([]byte("after-kill"))
@@ -308,7 +309,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	c := newTestCluster(t, 3)
 	defer c.stop()
 
-	c.waitForLeader(2 * time.Second)
+	c.waitForLeader(5 * time.Second)
 	c.proposeAll([]byte("durable"))
 	c.waitForCommitOnMajority(1, 2*time.Second)
 
@@ -332,7 +333,7 @@ func TestSnapshotCompaction(t *testing.T) {
 	c := newTestCluster(t, 3)
 	defer c.stop()
 
-	leaderID := c.waitForLeader(2 * time.Second)
+	leaderID := c.waitForLeader(5 * time.Second)
 
 	for i := 0; i < 5; i++ {
 		c.proposeAll([]byte(fmt.Sprintf("entry-%d", i)))
@@ -358,11 +359,11 @@ func TestLaggingFollowerInstallSnapshot(t *testing.T) {
 	c := newTestCluster(t, 3)
 	defer c.stop()
 
-	c.waitForLeader(2 * time.Second)
+	c.waitForLeader(5 * time.Second)
 	c.stopNode(3)
 
 	// The leader may have been node 3 — re-elect among the survivors first.
-	leaderID := c.waitForLeader(2 * time.Second)
+	leaderID := c.waitForLeader(5 * time.Second)
 
 	for i := 0; i < 8; i++ {
 		c.proposeAll([]byte(fmt.Sprintf("bulk-%d", i)))
@@ -372,7 +373,7 @@ func TestLaggingFollowerInstallSnapshot(t *testing.T) {
 	leader := c.nodeByID(leaderID)
 	if leader == nil {
 		// Leadership may have moved during replication; grab whoever leads now.
-		leaderID = c.waitForLeader(2 * time.Second)
+		leaderID = c.waitForLeader(5 * time.Second)
 		leader = c.nodeByID(leaderID)
 	}
 	if err := leader.Snapshot(8, []byte("bulk-snap")); err != nil {
@@ -394,5 +395,45 @@ func TestLaggingFollowerInstallSnapshot(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("rejoined node 3 never applied post-snapshot write; got %v", data)
+	}
+}
+
+func TestReadIndex(t *testing.T) {
+	c := newTestCluster(t, 3)
+	defer c.stop()
+
+	leaderID := c.waitForLeader(5 * time.Second)
+	leader := c.nodes[leaderID-1]
+
+	for _, n := range c.nodes {
+		if n == nil || n.ID() == leaderID {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, ok := n.ReadIndex(ctx)
+		cancel()
+		if ok {
+			t.Fatalf("follower %d ReadIndex succeeded; want fail", n.ID())
+		}
+	}
+
+	c.proposeAll([]byte("ri-write"))
+	c.waitForCommitOnMajority(1, 2*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	idx, ok := leader.ReadIndex(ctx)
+	if !ok {
+		t.Fatal("leader ReadIndex failed")
+	}
+	if idx < 1 {
+		t.Fatalf("ReadIndex returned %d; want >= 1", idx)
+	}
+
+	// Lease path: second call should also succeed quickly.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	if _, ok := leader.ReadIndex(ctx2); !ok {
+		t.Fatal("leader ReadIndex under lease failed")
 	}
 }

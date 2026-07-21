@@ -2,9 +2,9 @@
 //
 // Raft decides *order*; this package gives commands *meaning*. Every node
 // applies the same committed log entries in the same order and arrives at
-// the same map — that's state-machine replication. Linearizability comes from
-// routing reads and writes through the Raft log (nothing is served from stale
-// local state on a follower without going through consensus).
+// the same map — that's state-machine replication. Linearizable writes go
+// through the Raft log; linearizable reads use ReadIndex then local state
+// (see Cluster.Get).
 //
 // Exactly-once is enforced inside the state machine: each mutating command
 // carries a (clientID, requestID) pair. If requestID was already applied for
@@ -21,7 +21,7 @@ import (
 type OpType uint8
 
 const (
-	OpGet        OpType = 1 // linearizable read (still goes through the Raft log)
+	OpGet        OpType = 1 // legacy log-path Get (Cluster.Get uses ReadIndex instead)
 	OpPut        OpType = 2 // unconditional write
 	OpCAS        OpType = 3 // compare-and-swap: write only if current == expect
 	OpCheckpoint OpType = 4 // agent checkpoint blob stored under a session key
