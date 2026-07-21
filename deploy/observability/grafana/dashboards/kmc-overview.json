@@ -7,7 +7,7 @@
   "links": [],
   "panels": [
     {
-      "title": "Who is leader?",
+      "title": "who is leader? (1 = active)",
       "type": "timeseries",
       "gridPos": { "h": 10, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -27,7 +27,7 @@
       ]
     },
     {
-      "title": "Raft term",
+      "title": "raft term (election round)",
       "type": "timeseries",
       "gridPos": { "h": 10, "w": 12, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -40,7 +40,7 @@
       ]
     },
     {
-      "title": "Commit index (lockstep = healthy replication)",
+      "title": "commit index (shared progress)",
       "type": "timeseries",
       "gridPos": { "h": 10, "w": 12, "x": 0, "y": 10 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -53,7 +53,7 @@
       ]
     },
     {
-      "title": "Writes / sec (leader applies)",
+      "title": "writes / sec (leader applies)",
       "type": "timeseries",
       "gridPos": { "h": 10, "w": 6, "x": 12, "y": 10 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -66,7 +66,7 @@
       ]
     },
     {
-      "title": "Reads / sec (leader applies)",
+      "title": "reads / sec (leader applies)",
       "type": "timeseries",
       "gridPos": { "h": 10, "w": 6, "x": 18, "y": 10 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -79,7 +79,7 @@
       ]
     },
     {
-      "title": "Host CPU busy %",
+      "title": "host cpu busy % (vm load)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -100,7 +100,7 @@
       ]
     },
     {
-      "title": "Host memory used",
+      "title": "host memory used (vm ram)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -130,7 +130,7 @@
   "time": { "from": "now-5m", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Kill My Cluster",
+  "title": "kill my cluster",
   "uid": "kmc-overview",
-  "version": 3
+  "version": 4
 }
