@@ -15,13 +15,27 @@
 
 name: kmc
 
+# Container logs are capped so a long demo run cannot fill the VM root disk.
+# Default json-file logging is unbounded: at ~4.4k ops/s the 2026-07-21/22
+# Oracle box wedged with sshd unable to write (TCP open, no banner).
+# Ceiling here is 30MB per container, ~390MB across the stack.
+x-logging: &kmc-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
 
   node1:
     build: ../..
     container_name: kmc-node-1
+    cpus: 0.45
+    logging: *kmc-logging
     environment:
       NODE_ID: "1"
+      # Match the CPU cap: fewer runnable threads, less scheduler thrash.
+      GOMAXPROCS: "2"
       DATA_DIR: /data
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
@@ -38,8 +52,12 @@ services:
   node2:
     build: ../..
     container_name: kmc-node-2
+    cpus: 0.45
+    logging: *kmc-logging
     environment:
       NODE_ID: "2"
+      # Match the CPU cap: fewer runnable threads, less scheduler thrash.
+      GOMAXPROCS: "2"
       DATA_DIR: /data
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
@@ -55,8 +73,12 @@ services:
   node3:
     build: ../..
     container_name: kmc-node-3
+    cpus: 0.45
+    logging: *kmc-logging
     environment:
       NODE_ID: "3"
+      # Match the CPU cap: fewer runnable threads, less scheduler thrash.
+      GOMAXPROCS: "2"
       DATA_DIR: /data
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
@@ -72,8 +94,12 @@ services:
   node4:
     build: ../..
     container_name: kmc-node-4
+    cpus: 0.45
+    logging: *kmc-logging
     environment:
       NODE_ID: "4"
+      # Match the CPU cap: fewer runnable threads, less scheduler thrash.
+      GOMAXPROCS: "2"
       DATA_DIR: /data
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
@@ -89,8 +115,12 @@ services:
   node5:
     build: ../..
     container_name: kmc-node-5
+    cpus: 0.45
+    logging: *kmc-logging
     environment:
       NODE_ID: "5"
+      # Match the CPU cap: fewer runnable threads, less scheduler thrash.
+      GOMAXPROCS: "2"
       DATA_DIR: /data
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
@@ -106,8 +136,12 @@ services:
   node6:
     build: ../..
     container_name: kmc-node-6
+    cpus: 0.45
+    logging: *kmc-logging
     environment:
       NODE_ID: "6"
+      # Match the CPU cap: fewer runnable threads, less scheduler thrash.
+      GOMAXPROCS: "2"
       DATA_DIR: /data
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
@@ -123,8 +157,12 @@ services:
   node7:
     build: ../..
     container_name: kmc-node-7
+    cpus: 0.45
+    logging: *kmc-logging
     environment:
       NODE_ID: "7"
+      # Match the CPU cap: fewer runnable threads, less scheduler thrash.
+      GOMAXPROCS: "2"
       DATA_DIR: /data
       RAFT_ADDR: 0.0.0.0:7000
       KV_ADDR: 0.0.0.0:8000
@@ -142,6 +180,8 @@ services:
       context: ../..
       dockerfile: Dockerfile.loadgen
     container_name: kmc-loadgen
+    cpus: 0.3
+    logging: *kmc-logging
     environment:
       KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
       # Aligned to Oracle ladder ceiling (2026-07-21): ~1400w/3000r sustained
@@ -159,6 +199,8 @@ services:
       context: ../..
       dockerfile: Dockerfile.controlplane
     container_name: kmc-controlplane
+    cpus: 0.3
+    logging: *kmc-logging
     environment:
       HTTP_ADDR: 0.0.0.0:8080
       CONTROL_NODES: 1=kmc-node-1,2=kmc-node-2,3=kmc-node-3,4=kmc-node-4,5=kmc-node-5,6=kmc-node-6,7=kmc-node-7
@@ -177,6 +219,8 @@ services:
   web:
     build: ../../web
     container_name: kmc-web
+    cpus: 0.5
+    logging: *kmc-logging
     environment:
       HOST: 0.0.0.0
       PORT: "5173"
@@ -192,6 +236,8 @@ services:
   node-exporter:
     image: prom/node-exporter:v1.8.2
     container_name: kmc-node-exporter
+    cpus: 0.1
+    logging: *kmc-logging
     command:
       - --path.procfs=/host/proc
       - --path.sysfs=/host/sys
@@ -209,8 +255,22 @@ services:
   prometheus:
     image: prom/prometheus:v3.2.1
     container_name: kmc-prometheus
+    cpus: 0.3
+    logging: *kmc-logging
+    # scrape_interval is 1s (see prometheus.yml) to keep the wiki HUD live, so the
+    # TSDB grows ~15x faster than a default 15s scrape. Without these flags
+    # Prometheus keeps 15 days with no size cap, which is what filled the Oracle
+    # root disk. retention.size is the hard backstop: whichever limit hits first wins.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
+      - --storage.tsdb.retention.size=2GB
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
     ports:
       - "9090:9090"
     networks: [kmc]
@@ -220,6 +280,8 @@ services:
   grafana:
     image: grafana/grafana:11.5.2
     container_name: kmc-grafana
+    cpus: 0.3
+    logging: *kmc-logging
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
@@ -252,3 +314,6 @@ volumes:
   node5-data:
   node6-data:
   node7-data:
+  # Named so the TSDB survives container recreate and can be inspected or pruned
+  # directly. Bounding disk is done by the retention flags, not by this volume.
+  prom-data:
