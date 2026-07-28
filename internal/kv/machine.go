@@ -46,14 +46,27 @@ type DedupKey struct {
 // client's newest request re-executes instead of deduping. Real clients here
 // (loadgen workers, the traffic agent) only ever retry their most recent
 // request, so the window is never approached in practice.
+//
+// Sizing lesson (2026-07-28 post-deploy incident): the window is PER CLIENT,
+// so steady-state table size ≈ clients x window. With 96 loadgen workers and
+// the original window of 4096, that ceiling (~393k) sat far above the
+// high-water mark, so once the table passed high-water the sweep ran on
+// EVERY apply, scanning the whole table and freeing almost nothing — all 7
+// nodes pinned at their CPU caps for zero goodput. Keep clients x window
+// comfortably under dedupHighWater, and the sweepEvery guard bounds the
+// damage if that invariant is ever violated again.
 const (
 	// dedupWindow: keep results within this distance of a client's max seen
-	// requestID.
-	dedupWindow = 4096
+	// requestID. 128 is generous: our clients retry only their newest request.
+	dedupWindow = 128
 	// dedupHighWater: sweep when the table reaches this size. Without a bound
 	// the table grew one entry per write forever (~21.6M entries on the
 	// 6-day Oracle incident) and, once snapshots run, would bloat every one.
 	dedupHighWater = 16384
+	// dedupSweepEvery: at most one sweep per this many applies. A sweep is
+	// O(table); without this floor, a table that CANNOT shrink below
+	// high-water turns every apply into a full-table scan.
+	dedupSweepEvery = 1024
 )
 
 // WatchEvent is delivered to subscribers when a watched key changes.
@@ -73,6 +86,10 @@ type Machine struct {
 	// maxReq tracks each client's highest requestID seen, anchoring the
 	// deterministic dedup sweep (see the dedupWindow comment).
 	maxReq map[string]uint64
+	// applyCount counts dedup-tracked applies; it paces the sweep
+	// (dedupSweepEvery) and rides in snapshots so a restored replica sweeps
+	// at the same log positions as one that replayed — determinism.
+	applyCount uint64
 
 	// watchers[key] holds channels that receive an event when key changes.
 	// We never block Apply on a slow watcher — sends are non-blocking drops.
@@ -166,7 +183,8 @@ func (m *Machine) Apply(cmd Command) ApplyResult {
 		if cmd.RequestID > m.maxReq[cmd.ClientID] {
 			m.maxReq[cmd.ClientID] = cmd.RequestID
 		}
-		if len(m.applied) >= dedupHighWater {
+		m.applyCount++
+		if len(m.applied) >= dedupHighWater && m.applyCount%dedupSweepEvery == 0 {
 			m.sweepDedupLocked()
 		}
 	}
@@ -229,9 +247,10 @@ func (m *Machine) notifyLocked(key string, value []byte, found bool) {
 type snapshotData struct {
 	Data    map[string][]byte
 	Applied map[DedupKey]ApplyResult
-	// MaxReq must ride along or a restored node would sweep differently
-	// than one that applied the whole log — replica divergence.
-	MaxReq map[string]uint64
+	// MaxReq and ApplyCount must ride along or a restored node would sweep
+	// differently than one that applied the whole log — replica divergence.
+	MaxReq     map[string]uint64
+	ApplyCount uint64
 }
 
 // Snapshot exports the full machine state for Raft compaction.
@@ -259,7 +278,9 @@ func (m *Machine) Snapshot() ([]byte, error) {
 	}
 
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(snapshotData{Data: dataCopy, Applied: appliedCopy, MaxReq: maxReqCopy}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(snapshotData{
+		Data: dataCopy, Applied: appliedCopy, MaxReq: maxReqCopy, ApplyCount: m.applyCount,
+	}); err != nil {
 		return nil, fmt.Errorf("kv: encode snapshot: %w", err)
 	}
 	return buf.Bytes(), nil
@@ -276,6 +297,7 @@ func (m *Machine) Restore(raw []byte) error {
 	m.data = snap.Data
 	m.applied = snap.Applied
 	m.maxReq = snap.MaxReq
+	m.applyCount = snap.ApplyCount
 	if m.data == nil {
 		m.data = make(map[string][]byte)
 	}

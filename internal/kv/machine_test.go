@@ -2,6 +2,7 @@ package kv
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -125,12 +126,13 @@ func TestWatch(t *testing.T) {
 // documented trade-off).
 func TestDedupSweepBounded(t *testing.T) {
 	m := NewMachine()
-	total := dedupHighWater + dedupWindow + 100
+	total := dedupHighWater + dedupSweepEvery + dedupWindow + 100
 	for i := 1; i <= total; i++ {
 		m.Apply(Command{Op: OpPut, ClientID: "c", RequestID: uint64(i), Key: "k", Value: []byte("v")})
 	}
-	if len(m.applied) > dedupHighWater {
-		t.Fatalf("dedup table %d entries; bound is %d", len(m.applied), dedupHighWater)
+	// Sweeps are paced (dedupSweepEvery), so the bound carries that slack.
+	if len(m.applied) > dedupHighWater+dedupSweepEvery {
+		t.Fatalf("dedup table %d entries; bound is %d", len(m.applied), dedupHighWater+dedupSweepEvery)
 	}
 	res := m.Apply(Command{Op: OpPut, ClientID: "c", RequestID: uint64(total), Key: "k", Value: []byte("x")})
 	if !res.Duplicate {
@@ -139,5 +141,33 @@ func TestDedupSweepBounded(t *testing.T) {
 	res = m.Apply(Command{Op: OpPut, ClientID: "c", RequestID: 1, Key: "k", Value: []byte("y")})
 	if res.Duplicate {
 		t.Fatal("out-of-window retry claimed Duplicate; sweep should have dropped it")
+	}
+}
+
+// TestDedupSweepManyClients is the regression for the 2026-07-28 production
+// smother: with ~100 clients (per-worker loadgen IDs), clients x window must
+// stay under the high-water mark or the sweep can never shrink the table and
+// (pre-fix) ran a full-table scan on every apply across all replicas.
+func TestDedupSweepManyClients(t *testing.T) {
+	const clients = 96
+	if clients*dedupWindow >= dedupHighWater {
+		t.Fatalf("invariant broken: clients(%d) x dedupWindow(%d) = %d must stay under dedupHighWater(%d)",
+			clients, dedupWindow, clients*dedupWindow, dedupHighWater)
+	}
+	m := NewMachine()
+	// Interleave clients like concurrent workers; enough traffic to cross
+	// high-water several times over.
+	perClient := (dedupHighWater*3)/clients + 1
+	for r := 1; r <= perClient; r++ {
+		for c := 0; c < clients; c++ {
+			m.Apply(Command{
+				Op: OpPut, ClientID: fmt.Sprintf("w-%d", c), RequestID: uint64(r),
+				Key: "k", Value: []byte("v"),
+			})
+		}
+	}
+	if got, bound := len(m.applied), clients*dedupWindow+dedupSweepEvery; got > bound {
+		t.Fatalf("dedup table %d entries with %d clients; want <= %d (clients x window + sweep slack)",
+			got, clients, bound)
 	}
 }
