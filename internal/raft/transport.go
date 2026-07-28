@@ -20,7 +20,9 @@ import (
 
 	"github.com/AnushSonone/kill-my-cluster/internal/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // Server exposes a Node over gRPC. It implements raftpb.RaftServer.
@@ -138,6 +140,15 @@ func (t *GRPCTransport) client(peer uint64) (raftpb.RaftClient, error) {
 	return raftpb.NewRaftClient(conn), nil
 }
 
+// isConnError reports whether an RPC failure indicates the CONNECTION is bad
+// (peer down or restarted) rather than the peer merely being slow. Only the
+// former warrants tearing down the cached HTTP/2 session. DeadlineExceeded is
+// exactly the error a starved-but-alive peer produces; re-dialing on it adds
+// handshake churn at the worst possible moment.
+func isConnError(err error) bool {
+	return status.Code(err) == codes.Unavailable
+}
+
 // InvalidatePeer drops a cached connection so the next RPC re-dials. Call
 // after a peer restarts on the same address — gRPC may otherwise keep a dead
 // session open until the next heartbeat fails.
@@ -156,7 +167,7 @@ func (t *GRPCTransport) RequestVote(ctx context.Context, peer uint64, req *raftp
 		return nil, err
 	}
 	resp, err := c.RequestVote(ctx, req)
-	if err != nil {
+	if err != nil && isConnError(err) {
 		t.InvalidatePeer(peer)
 	}
 	return resp, err
@@ -168,7 +179,7 @@ func (t *GRPCTransport) AppendEntries(ctx context.Context, peer uint64, req *raf
 		return nil, err
 	}
 	resp, err := c.AppendEntries(ctx, req)
-	if err != nil {
+	if err != nil && isConnError(err) {
 		t.InvalidatePeer(peer)
 	}
 	return resp, err
@@ -180,7 +191,7 @@ func (t *GRPCTransport) InstallSnapshot(ctx context.Context, peer uint64, req *r
 		return nil, err
 	}
 	resp, err := c.InstallSnapshot(ctx, req)
-	if err != nil {
+	if err != nil && isConnError(err) {
 		t.InvalidatePeer(peer)
 	}
 	return resp, err

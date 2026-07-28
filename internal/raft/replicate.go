@@ -31,61 +31,79 @@ const (
 	maxAppendEntries = 64
 )
 
-// runHeartbeats sends AppendEntries to every follower on a fixed interval for
-// as long as this node remains leader of the term it was elected in. Started
-// by becomeLeaderLocked; exits on step-down or shutdown.
+// replState is one per-follower replication loop's identity: which peer, for
+// which leadership term, and the channel that nudges it awake. A fresh set is
+// built on every election win, so a loop from an old leadership can never
+// consume a new leadership's notifications.
+type replState struct {
+	peer   uint64
+	term   uint64
+	notify chan struct{} // cap 1: a pending wakeup covers all newer ones
+}
+
+// runReplicator owns ALL sending to one follower for one leadership term:
+// heartbeats, entry replication, catch-up, and snapshots, with exactly one
+// RPC in flight at a time. Started by becomeLeaderLocked; exits on step-down,
+// term change, or shutdown.
+//
+// This replaces the old spawn-per-broadcast design, which created a goroutine
+// per peer per heartbeat tick AND per propose batch (~12k goroutines/s at
+// 1400 writes/s) with no per-peer in-flight limit — under load the goroutine
+// pileup itself became a CPU source. Here, propose batches that land while an
+// RPC is in flight coalesce into the next send: better batching, bounded work.
 //
 // Heartbeats are not a separate message type — they are ordinary
-// AppendEntries that happen to carry zero entries (or, conveniently, whatever
-// entries the follower is missing). This unification means every heartbeat
-// also repairs lagging followers and re-delivers the leader's commitIndex.
-func (n *Node) runHeartbeats() {
+// AppendEntries that happen to carry zero entries. Every heartbeat also
+// repairs lagging followers and re-delivers the leader's commitIndex.
+func (n *Node) runReplicator(rs *replState) {
 	defer n.wg.Done()
-
-	n.mu.Lock()
-	myTerm := n.currentTerm
-	n.mu.Unlock()
-
-	ticker := time.NewTicker(heartbeatInterval)
+	ticker := time.NewTicker(n.tm.HeartbeatInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		n.mu.Lock()
-		if n.stopped || n.role != Leader || n.currentTerm != myTerm {
-			n.mu.Unlock()
+	for {
+		// The first pass announces leadership (empty AppendEntries) before
+		// any tick — followers' election timers are suppressed immediately.
+		again, alive := n.replicateOnce(rs.peer, rs.term)
+		if !alive {
 			return
 		}
-		n.mu.Unlock()
-		n.broadcastAppendEntries()
+		if again {
+			continue // more entries pending or nextIndex just repaired
+		}
+		select {
+		case <-n.done:
+			return
+		case <-rs.notify: // a propose batch or commit advance wants out
+		case <-ticker.C: // heartbeat; also paces retries after RPC errors
+		}
 	}
 }
 
-// broadcastAppendEntries kicks off one replication round to every peer.
-// Called on the heartbeat tick, immediately on winning an election, and
-// immediately on Propose (so commit latency is one RTT, not one heartbeat).
-func (n *Node) broadcastAppendEntries() {
-	n.mu.Lock()
-	if n.role != Leader {
-		n.mu.Unlock()
-		return
-	}
-	term := n.currentTerm
-	n.mu.Unlock()
-
-	for _, peer := range n.peers {
-		go n.replicateToPeer(peer, term)
+// notifyReplicatorsLocked nudges every per-follower loop to send now instead
+// of waiting for the next heartbeat tick. Non-blocking: if a loop already has
+// a pending wakeup, this one is covered by it. Caller holds mu.
+func (n *Node) notifyReplicatorsLocked() {
+	for _, rs := range n.repls {
+		select {
+		case rs.notify <- struct{}{}:
+		default:
+		}
 	}
 }
 
-// replicateToPeer sends one AppendEntries (or InstallSnapshot) to one peer
-// and processes the response. term is the leadership term this round belongs
-// to; if the node's term has moved on by the time we look again, the round is
-// abandoned.
-func (n *Node) replicateToPeer(peer uint64, term uint64) {
+// replicateOnce sends one AppendEntries (or InstallSnapshot) to one peer and
+// processes the response.
+//
+// again=true asks the caller to run another pass immediately (entries still
+// pending, or nextIndex was just repaired); alive=false tells it this
+// leadership is over (stopped, deposed, or term moved on) and the loop must
+// exit. An RPC error returns (false, true): wait one heartbeat tick — natural
+// backoff against a dead peer, with no goroutine pileup.
+func (n *Node) replicateOnce(peer uint64, term uint64) (again, alive bool) {
 	n.mu.Lock()
 	if n.stopped || n.role != Leader || n.currentTerm != term {
 		n.mu.Unlock()
-		return
+		return false, false
 	}
 
 	next := n.nextIndex[peer]
@@ -94,8 +112,7 @@ func (n *Node) replicateToPeer(peer uint64, term uint64) {
 	// compacted into a snapshot). Ship the whole snapshot; the log-based
 	// path resumes from the snapshot's index afterwards.
 	if next <= n.log.firstIndex() {
-		n.sendSnapshotLocked(peer, term) // unlocks internally
-		return
+		return n.sendSnapshotLocked(peer, term) // unlocks internally
 	}
 
 	// prev(LogIndex|Term) anchor the consistency check: the follower accepts
@@ -119,27 +136,29 @@ func (n *Node) replicateToPeer(peer uint64, term uint64) {
 	}
 	n.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), heartbeatInterval*2)
+	ctx, cancel := context.WithTimeout(context.Background(), n.tm.HeartbeatInterval*2)
 	defer cancel()
 	resp, err := n.transport.AppendEntries(ctx, peer, req)
 	if err != nil {
-		return // dead/unreachable peer; the next heartbeat retries
+		return false, true // dead/unreachable peer; the next tick retries
 	}
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopped {
-		return
+		return false, false
 	}
 	if resp.Term > n.currentTerm {
 		// Someone out there has a newer term — we are yesterday's leader.
 		n.becomeFollowerLocked(resp.Term)
-		return
+		return false, false
 	}
 	// Stale response guard: only act if we're still the same-term leader.
 	if n.role != Leader || n.currentTerm != term {
-		return
+		return false, false
 	}
+	// Any response — success or rejection — proves the peer is alive.
+	n.noteContactLocked(peer)
 
 	if resp.Success {
 		// The follower now provably holds everything we sent. Advance both
@@ -153,7 +172,9 @@ func (n *Node) replicateToPeer(peer uint64, term uint64) {
 			n.nextIndex[peer] = newMatch + 1
 		}
 		n.maybeAdvanceCommitLocked()
-		return
+		// Still behind (catch-up capped at maxAppendEntries per pass)?
+		// Stream the next chunk without waiting for a tick.
+		return n.nextIndex[peer] <= n.log.lastIndex(), true
 	}
 
 	// Rejected: the consistency check failed. Use the follower's conflict
@@ -180,19 +201,20 @@ func (n *Node) replicateToPeer(peer uint64, term uint64) {
 	if n.nextIndex[peer] < 1 {
 		n.nextIndex[peer] = 1
 	}
-	// Retry immediately with the repaired nextIndex rather than waiting a
-	// full heartbeat — divergent followers converge in a few round-trips.
-	go n.replicateToPeer(peer, term)
+	// Retry immediately with the repaired nextIndex — sequentially, in this
+	// same loop. Divergent followers converge in a few round-trips without
+	// the old unbounded goroutine recursion.
+	return true, true
 }
 
 // sendSnapshotLocked ships the current snapshot to a follower whose nextIndex
 // predates our earliest retained log entry. Caller holds mu; this function
-// releases it around the RPC.
-func (n *Node) sendSnapshotLocked(peer uint64, term uint64) {
+// releases it around the RPC. Return values follow replicateOnce's contract.
+func (n *Node) sendSnapshotLocked(peer uint64, term uint64) (again, alive bool) {
 	snapIdx, snapTerm, data, err := n.persist.readSnapshot()
 	if err != nil || snapIdx == 0 {
 		n.mu.Unlock()
-		return
+		return false, true // nothing to ship yet; wait for a tick
 	}
 	req := &raftpb.InstallSnapshotRequest{
 		Term:              term,
@@ -204,33 +226,35 @@ func (n *Node) sendSnapshotLocked(peer uint64, term uint64) {
 	n.mu.Unlock()
 
 	// Snapshots can be large; give the transfer more room than a heartbeat.
-	ctx, cancel := context.WithTimeout(context.Background(), heartbeatInterval*10)
+	ctx, cancel := context.WithTimeout(context.Background(), n.tm.HeartbeatInterval*10)
 	defer cancel()
 	resp, err := n.transport.InstallSnapshot(ctx, peer, req)
 	if err != nil {
-		return
+		return false, true
 	}
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopped {
-		return
+		return false, false
 	}
 	if resp.Term > n.currentTerm {
 		n.becomeFollowerLocked(resp.Term)
-		return
+		return false, false
 	}
 	if n.role != Leader || n.currentTerm != term {
-		return
+		return false, false
 	}
+	n.noteContactLocked(peer)
 	// The follower now holds state through snapIdx; log replication resumes
-	// from the entry right after it.
+	// from the entry right after it — immediately, not next tick.
 	if snapIdx > n.matchIndex[peer] {
 		n.matchIndex[peer] = snapIdx
 	}
 	if snapIdx+1 > n.nextIndex[peer] {
 		n.nextIndex[peer] = snapIdx + 1
 	}
+	return true, true
 }
 
 // maybeAdvanceCommitLocked applies the commit rule (§5.3, §5.4.2): find the
@@ -261,7 +285,9 @@ func (n *Node) maybeAdvanceCommitLocked() {
 		if count >= majority {
 			n.commitIndex = idx
 			n.applyCond.Broadcast()
-			// Followers learn the new commitIndex on the next heartbeat.
+			// Tell the replicators now, so followers learn the new
+			// commitIndex within one RTT instead of one heartbeat.
+			n.notifyReplicatorsLocked()
 			return
 		}
 	}

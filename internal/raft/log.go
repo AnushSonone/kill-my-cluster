@@ -25,6 +25,8 @@ package raft
 // matching the paper's convention that the log starts at index 1.
 
 import (
+	"sort"
+
 	pb "github.com/AnushSonone/kill-my-cluster/internal/raftpb"
 )
 
@@ -116,11 +118,16 @@ func (l *raftLog) truncateFrom(i uint64) {
 // firstIndexOfTerm returns the smallest in-memory index whose entry has the
 // given term, or 0 if no such entry exists. Used to build the conflict hints
 // that let a leader skip back over a whole divergent term in one round-trip.
+//
+// Terms never decrease along a valid Raft log, so this is a binary search.
+// Both scans sit on RPC-handler paths under the node mutex; before compaction
+// existed a linear walk here over a multi-million-entry log was a real CPU
+// sink during term churn.
 func (l *raftLog) firstIndexOfTerm(t uint64) uint64 {
-	for _, e := range l.entries[1:] { // skip sentinel
-		if e.Term == t {
-			return e.Index
-		}
+	reals := l.entries[1:] // skip sentinel
+	i := sort.Search(len(reals), func(j int) bool { return reals[j].Term >= t })
+	if i < len(reals) && reals[i].Term == t {
+		return reals[i].Index
 	}
 	return 0
 }
@@ -129,10 +136,10 @@ func (l *raftLog) firstIndexOfTerm(t uint64) uint64 {
 // given term, or 0 if none. The leader uses this with a follower's
 // conflictTerm hint (§5.3 fast backup).
 func (l *raftLog) lastIndexOfTerm(t uint64) uint64 {
-	for i := len(l.entries) - 1; i >= 1; i-- {
-		if l.entries[i].Term == t {
-			return l.entries[i].Index
-		}
+	reals := l.entries[1:] // skip sentinel
+	i := sort.Search(len(reals), func(j int) bool { return reals[j].Term > t })
+	if i > 0 && reals[i-1].Term == t {
+		return reals[i-1].Index
 	}
 	return 0
 }

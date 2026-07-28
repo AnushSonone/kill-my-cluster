@@ -20,20 +20,29 @@ type testKVCluster struct {
 	t        *testing.T
 	dirs     []string
 	addrs    map[uint64]string
-	clusters []*Cluster
-	servers  []*raft.Server
-	kvAddrs  map[uint64]string
+	clusters  []*Cluster
+	servers   []*raft.Server
+	kvServers []*KVServer
+	kvAddrs   map[uint64]string
+	// cfgTweak lets a test adjust each node's Config before boot
+	// (e.g. aggressive snapshot cadence).
+	cfgTweak func(*Config)
 }
 
 func newTestKVCluster(t *testing.T, n int) *testKVCluster {
+	return newTestKVClusterCfg(t, n, nil)
+}
+
+func newTestKVClusterCfg(t *testing.T, n int, tweak func(*Config)) *testKVCluster {
 	t.Helper()
-	c := &testKVCluster{t: t}
+	c := &testKVCluster{t: t, cfgTweak: tweak}
 	base := t.TempDir()
 	c.addrs = make(map[uint64]string)
 	c.kvAddrs = make(map[uint64]string)
 	c.dirs = make([]string, n)
 	c.clusters = make([]*Cluster, n)
 	c.servers = make([]*raft.Server, n)
+	c.kvServers = make([]*KVServer, n)
 
 	raftListeners := make([]net.Listener, n)
 	kvListeners := make([]net.Listener, n)
@@ -75,10 +84,21 @@ func (c *testKVCluster) boot(i int, raftLis, kvLis net.Listener) {
 		peerAddrs[pid] = addr
 	}
 
-	cl, err := NewCluster(Config{
+	cfg := Config{
 		ID: id, Peers: peers, Dir: c.dirs[i],
 		Transport: raft.NewGRPCTransport(peerAddrs),
-	})
+		// Fast clocks: same ratios as production, ~7x quicker suite.
+		Timings: raft.Timings{
+			ElectionTimeoutMin: 100 * time.Millisecond,
+			ElectionTimeoutMax: 200 * time.Millisecond,
+			HeartbeatInterval:  30 * time.Millisecond,
+			TickInterval:       10 * time.Millisecond,
+		},
+	}
+	if c.cfgTweak != nil {
+		c.cfgTweak(&cfg)
+	}
+	cl, err := NewCluster(cfg)
 	if err != nil {
 		t.Fatalf("cluster %d: %v", id, err)
 	}
@@ -91,19 +111,50 @@ func (c *testKVCluster) boot(i int, raftLis, kvLis net.Listener) {
 	if err != nil {
 		t.Fatalf("kv server %d: %v", id, err)
 	}
-	_ = kvSrv
 
 	c.clusters[i] = cl
 	c.servers[i] = raftSrv
+	c.kvServers[i] = kvSrv
+}
+
+// restart stops node i and boots it again from its on-disk state on the same
+// addresses (server first, then cluster — mirrors production shutdown order).
+func (c *testKVCluster) restart(i int) {
+	t := c.t
+	id := uint64(i + 1)
+	if c.servers[i] != nil {
+		c.servers[i].Stop()
+		c.servers[i] = nil
+	}
+	if c.kvServers[i] != nil {
+		c.kvServers[i].Stop()
+		c.kvServers[i] = nil
+	}
+	if c.clusters[i] != nil {
+		c.clusters[i].Stop()
+		c.clusters[i] = nil
+	}
+	rl, err := net.Listen("tcp", c.addrs[id])
+	if err != nil {
+		t.Fatalf("restart re-listen raft %d: %v", id, err)
+	}
+	kl, err := net.Listen("tcp", c.kvAddrs[id])
+	if err != nil {
+		t.Fatalf("restart re-listen kv %d: %v", id, err)
+	}
+	c.boot(i, rl, kl)
 }
 
 func (c *testKVCluster) stop() {
 	for i := range c.clusters {
-		if c.clusters[i] != nil {
-			c.clusters[i].Stop()
-		}
 		if c.servers[i] != nil {
 			c.servers[i].Stop()
+		}
+		if c.kvServers[i] != nil {
+			c.kvServers[i].Stop()
+		}
+		if c.clusters[i] != nil {
+			c.clusters[i].Stop()
 		}
 	}
 }
@@ -356,5 +407,89 @@ func TestGetUsesReadIndexNotLog(t *testing.T) {
 	after := leader.Raft().CommitIndex()
 	if after != before {
 		t.Fatalf("commit index moved %d -> %d after Gets; ReadIndex must not append", before, after)
+	}
+}
+
+// TestAutoSnapshotUnderLoad pins the compaction wiring end-to-end: sustained
+// ExecuteOnce load must trigger automatic snapshots (the 2026-07 incident's
+// deepest defect was that compaction never ran — 21.6M entries in RAM), a
+// restarted node must recover from snapshot + tail instead of a full replay,
+// and exactly-once dedup must survive the snapshot round-trip.
+func TestAutoSnapshotUnderLoad(t *testing.T) {
+	c := newTestKVClusterCfg(t, 3, func(cfg *Config) {
+		cfg.SnapshotEntries = 256
+		cfg.SnapshotRetain = -1 // full compaction so FirstIndex moves visibly
+	})
+	defer c.stop()
+	c.waitForLeader(5 * time.Second)
+	ctx := context.Background()
+
+	const writes = 700
+	for n := 1; n <= writes; n++ {
+		key := fmt.Sprintf("auto/%d", n%100)
+		err := c.proposeViaLeader(ctx, func(cl *Cluster) error {
+			_, err := cl.ExecuteOnce(ctx, "snap-test", uint64(n), Command{
+				Op: OpPut, Key: key, Value: []byte(fmt.Sprintf("%d", n)),
+			})
+			return err
+		})
+		if err != nil {
+			t.Fatalf("write %d: %v", n, err)
+		}
+	}
+
+	// Compaction ran on the leader.
+	leader := c.waitForLeader(5 * time.Second)
+	if fi := leader.Raft().FirstIndex(); fi == 0 {
+		t.Fatal("no automatic snapshot after sustained load (FirstIndex still 0)")
+	}
+
+	// Dedup survives: a retried recent request must return its original
+	// result, not re-execute.
+	var dup ApplyResult
+	err := c.proposeViaLeader(ctx, func(cl *Cluster) error {
+		res, err := cl.ExecuteOnce(ctx, "snap-test", uint64(writes), Command{
+			Op: OpPut, Key: "auto/0", Value: []byte("SHOULD-NOT-APPLY"),
+		})
+		dup = res
+		return err
+	})
+	if err != nil {
+		t.Fatalf("dedup retry: %v", err)
+	}
+	if !dup.Duplicate {
+		t.Fatal("retried request re-executed; dedup lost across snapshots")
+	}
+
+	// A restarted follower recovers via snapshot restore + tail replay.
+	victim := -1
+	for i, cl := range c.clusters {
+		if cl != nil && !cl.IsLeader() {
+			victim = i
+			break
+		}
+	}
+	if victim < 0 {
+		t.Fatal("no follower to restart")
+	}
+	c.restart(victim)
+
+	target := leader.Raft().CommitIndex()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.clusters[victim].Raft().LastApplied() >= target {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := c.clusters[victim].Raft().LastApplied(); got < target {
+		t.Fatalf("restarted node applied %d < leader commit %d", got, target)
+	}
+	// State correctness after restore: auto/0 was last written by write 700.
+	if v, ok := c.clusters[victim].machine.Get("auto/0"); !ok || string(v) != "700" {
+		t.Fatalf("restarted node has auto/0=%q ok=%v, want \"700\"", v, ok)
+	}
+	if fi := c.clusters[victim].Raft().FirstIndex(); fi == 0 {
+		t.Fatal("restarted node shows no compaction (FirstIndex 0)")
 	}
 }

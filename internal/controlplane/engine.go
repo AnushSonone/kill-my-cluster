@@ -57,6 +57,17 @@ type Engine struct {
 	viewersMu sync.Mutex
 	viewers   int
 
+	// Snapshot cache: building a Snapshot shells out to docker inspect 1-2x
+	// per node plus an HTTP probe per node. Uncached, every SSE viewer paid
+	// that cost twice a second — O(viewers) process spawns on a small VM.
+	snapMu     sync.Mutex
+	snapCached Snapshot
+	snapAt     time.Time
+
+	// reconStop ends the reconcile loop (see StartReconciler).
+	reconStop chan struct{}
+	reconOnce sync.Once
+
 	// Quorum edge tracking for HUD "time since last quorum loss".
 	quorumMu         sync.Mutex
 	sawQuorum        bool // true after first successful quorum observation
@@ -158,14 +169,85 @@ func (e *Engine) activeUsers() int {
 	return e.viewers
 }
 
-// Close cancels pending heal timers.
+// Close stops the reconciler and cancels pending heal timers.
 func (e *Engine) Close() error {
+	e.reconOnce.Do(func() {
+		if e.reconStop != nil {
+			close(e.reconStop)
+		}
+	})
 	e.healMu.Lock()
 	defer e.healMu.Unlock()
 	for id, job := range e.heals {
 		e.cancelHealLocked(id, job)
 	}
 	return nil
+}
+
+// StartReconciler begins a background loop that repairs drift between
+// desired state ("every whitelisted node running and connected") and actual
+// Docker state. Nodes inside an active heal window are intentional outages
+// and are left alone.
+//
+// This is what the old heal design could not cover: heal timers lived only
+// in this process's memory and only for CP-initiated kills. A container that
+// crashed on its own, or whose heal timer died with a CP restart, stayed
+// down forever (node-3 in the 2026-07 incident). The reconciler needs no
+// persistent state — desired state is implied by the whitelist.
+func (e *Engine) StartReconciler(interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	e.reconStop = make(chan struct{})
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-e.reconStop:
+				return
+			case <-t.C:
+				e.reconcileOnce()
+			}
+		}
+	}()
+}
+
+func (e *Engine) reconcileOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, n := range e.Nodes() {
+		if e.healPending(n.ID) {
+			continue // intentional outage; the heal timer owns it
+		}
+		st, err := e.inspect(ctx, n)
+		if err != nil {
+			continue // docker unavailable or container unknown; try next tick
+		}
+		if !st.Running {
+			if err := e.run(ctx, "start", n.ContainerName); err != nil {
+				e.addEvent("heal", fmt.Sprintf("Node %d reconcile start failed: %v", n.ID, err))
+				continue
+			}
+			if e.network != "" {
+				_ = e.connectNetwork(ctx, n.ContainerName)
+			}
+			e.addEvent("heal", fmt.Sprintf("Node %d reconciled (was down outside any heal window)", n.ID))
+			continue
+		}
+		if st.Partitioned {
+			if err := e.connectNetwork(ctx, n.ContainerName); err == nil {
+				e.addEvent("heal", fmt.Sprintf("Node %d reconciled (rejoined network)", n.ID))
+			}
+		}
+	}
+}
+
+func (e *Engine) healPending(id uint64) bool {
+	e.healMu.Lock()
+	defer e.healMu.Unlock()
+	_, ok := e.heals[id]
+	return ok
 }
 
 // HealAfter returns the configured auto-heal delay.
@@ -222,8 +304,22 @@ type Snapshot struct {
 	Events            []Event  `json:"events"`
 }
 
-// Snapshot builds the current cluster view.
+// Snapshot returns the current cluster view, cached for 500ms so N SSE
+// viewers cost one build per tick instead of N.
 func (e *Engine) Snapshot(ctx context.Context) Snapshot {
+	e.snapMu.Lock()
+	defer e.snapMu.Unlock()
+	if time.Since(e.snapAt) < 500*time.Millisecond {
+		return e.snapCached
+	}
+	snap := e.buildSnapshot(ctx)
+	e.snapCached = snap
+	e.snapAt = time.Now()
+	return snap
+}
+
+// buildSnapshot assembles the cluster view from live Docker + Raft state.
+func (e *Engine) buildSnapshot(ctx context.Context) Snapshot {
 	list, _ := e.List(ctx)
 	alive := 0
 	var leaderID, term uint64
@@ -336,12 +432,17 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 			return err
 		}
 		e.cancelHeal(id)
+		// Register the heal BEFORE stopping: the reconcile loop treats a
+		// pending heal as "this outage is intentional" — scheduling first
+		// means there is never a moment where a freshly killed container
+		// looks like an accident and gets insta-restarted.
+		e.scheduleHeal(id, "start")
 		// -t 1 ≈ abrupt crash (Raft's intended failure mode).
 		if err := e.run(ctx, "stop", "-t", "1", n.ContainerName); err != nil {
+			e.cancelHeal(id)
 			return err
 		}
 		e.addEvent("kill", fmt.Sprintf("Machine %d killed", id))
-		e.scheduleHeal(id, "start")
 		return nil
 
 	case ActionRestart:
@@ -379,11 +480,13 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if st.Partitioned {
 			return fmt.Errorf("controlplane: machine %d already partitioned", id)
 		}
+		// Heal first for the same reconciler reason as ActionKill.
+		e.scheduleHeal(id, "reconnect")
 		if err := e.run(ctx, "network", "disconnect", e.network, n.ContainerName); err != nil {
+			e.cancelHeal(id)
 			return err
 		}
 		e.addEvent("partition", fmt.Sprintf("Machine %d partitioned", id))
-		e.scheduleHeal(id, "reconnect")
 		return nil
 
 	default:

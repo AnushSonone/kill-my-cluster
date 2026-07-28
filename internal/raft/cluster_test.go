@@ -17,6 +17,17 @@ import (
 	"time"
 )
 
+// testTimings are ~7x faster than production so the suite runs quickly. The
+// ratios mirror production (heartbeat << election min < max; tick smallest).
+func testTimings() Timings {
+	return Timings{
+		ElectionTimeoutMin: 100 * time.Millisecond,
+		ElectionTimeoutMax: 200 * time.Millisecond,
+		HeartbeatInterval:  30 * time.Millisecond,
+		TickInterval:       10 * time.Millisecond,
+	}
+}
+
 // testCluster is a disposable Raft group wired through real gRPC.
 type testCluster struct {
 	t          *testing.T
@@ -25,8 +36,27 @@ type testCluster struct {
 	nodes      []*Node
 	servers    []*Server
 	transports []*GRPCTransport
+	gates      []*gateTransport // partition gates (stability_test.go)
 	apply      [][]ApplyMsg
 	applyMu    sync.Mutex
+	// nodesMu guards the slices above when a test goroutine (e.g. the storm
+	// test's background proposer) reads them while the main test goroutine
+	// stops/boots nodes.
+	nodesMu sync.Mutex
+}
+
+// liveNodes returns a snapshot of the current node pointers, safe to use
+// from concurrent test goroutines.
+func (c *testCluster) liveNodes() []*Node {
+	c.nodesMu.Lock()
+	defer c.nodesMu.Unlock()
+	out := make([]*Node, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		if n != nil {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func newTestCluster(t *testing.T, nNodes int) *testCluster {
@@ -42,6 +72,7 @@ func newTestCluster(t *testing.T, nNodes int) *testCluster {
 	c.nodes = make([]*Node, nNodes)
 	c.servers = make([]*Server, nNodes)
 	c.transports = make([]*GRPCTransport, nNodes)
+	c.gates = make([]*gateTransport, nNodes)
 	c.apply = make([][]ApplyMsg, nNodes)
 
 	// Reserve stable addresses up front so a restarted node can re-bind the
@@ -85,9 +116,14 @@ func (c *testCluster) bootNode(i int, lis net.Listener) {
 	go c.drainApply(i, ch)
 
 	transport := NewGRPCTransport(peerAddrs)
+	gate := &gateTransport{inner: transport}
 	node, err := NewNode(Config{
 		ID: id, Peers: peers, Dir: c.dirs[i],
-		Transport: transport, ApplyCh: ch,
+		Transport: gate, ApplyCh: ch,
+		Timings: testTimings(),
+		// No retention margin: these tests drive Node.Snapshot at tiny
+		// indices and assert real compaction + InstallSnapshot behavior.
+		SnapshotRetain: -1,
 	})
 	if err != nil {
 		t.Fatalf("node %d: %v", id, err)
@@ -97,9 +133,12 @@ func (c *testCluster) bootNode(i int, lis net.Listener) {
 		t.Fatalf("server %d: %v", id, err)
 	}
 
+	c.nodesMu.Lock()
 	c.nodes[i] = node
 	c.servers[i] = srv
 	c.transports[i] = transport
+	c.gates[i] = gate
+	c.nodesMu.Unlock()
 }
 
 func (c *testCluster) drainApply(idx int, ch chan ApplyMsg) {
@@ -117,17 +156,22 @@ func (c *testCluster) stop() {
 }
 
 func (c *testCluster) stopIndex(i int) {
-	if c.nodes[i] != nil {
-		c.nodes[i].Stop()
-		c.nodes[i] = nil
+	// Detach under the lock, then shut down outside it (Node.Stop blocks on
+	// goroutine drain; concurrent readers shouldn't wait on that).
+	c.nodesMu.Lock()
+	node, tr, srv := c.nodes[i], c.transports[i], c.servers[i]
+	c.nodes[i], c.transports[i], c.servers[i] = nil, nil, nil
+	c.nodesMu.Unlock()
+	// Server first: stop accepting RPCs before the node closes its WAL
+	// (mirrors cmd/node's shutdown order).
+	if srv != nil {
+		srv.Stop()
 	}
-	if c.transports[i] != nil {
-		c.transports[i].Close()
-		c.transports[i] = nil
+	if node != nil {
+		node.Stop()
 	}
-	if c.servers[i] != nil {
-		c.servers[i].Stop()
-		c.servers[i] = nil
+	if tr != nil {
+		tr.Close()
 	}
 }
 

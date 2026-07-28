@@ -44,7 +44,9 @@ func main() {
 	transport := raft.NewGRPCTransport(cfg.raftPeers)
 	cl, err := kv.NewCluster(kv.Config{
 		ID: cfg.id, Peers: cfg.peerIDs, Dir: cfg.dataDir,
-		Transport: transport,
+		Transport:       transport,
+		Timings:         cfg.timings,
+		SnapshotEntries: cfg.snapshotEntries,
 	})
 	if err != nil {
 		fatalf("cluster: %v", err)
@@ -122,7 +124,9 @@ type config struct {
 	peerIDs     []uint64
 	raftPeers   map[uint64]string
 	kvPeers     map[uint64]string
-	runAgent    bool
+	runAgent        bool
+	timings         raft.Timings
+	snapshotEntries uint64
 }
 
 func loadConfig() (config, error) {
@@ -155,8 +159,52 @@ func loadConfig() (config, error) {
 		peerIDs:     peerIDs,
 		raftPeers:   raftPeers,
 		kvPeers:     kvPeers,
-		runAgent:    runAgent,
+		runAgent:        runAgent,
+		timings:         loadTimings(),
+		snapshotEntries: loadSnapshotEntries(),
 	}, nil
+}
+
+// loadSnapshotEntries reads SNAPSHOT_ENTRIES (0/unset = kv default of 10000).
+// Floored at 512 in production: more frequent snapshots than that spend more
+// time rewriting the WAL than the compaction saves.
+func loadSnapshotEntries() uint64 {
+	v := os.Getenv("SNAPSHOT_ENTRIES")
+	if v == "" {
+		return 0
+	}
+	nv, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ignoring SNAPSHOT_ENTRIES=%q: %v\n", v, err)
+		return 0
+	}
+	if nv < 512 {
+		nv = 512
+	}
+	return nv
+}
+
+// loadTimings reads optional Raft clock overrides. Unset or malformed values
+// fall back to raft defaults (zero fields), so a bad env never bricks a node.
+func loadTimings() raft.Timings {
+	dur := func(key string) time.Duration {
+		v := os.Getenv(key)
+		if v == "" {
+			return 0
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			fmt.Fprintf(os.Stderr, "ignoring %s=%q: %v\n", key, v, err)
+			return 0
+		}
+		return d
+	}
+	return raft.Timings{
+		ElectionTimeoutMin: dur("RAFT_ELECTION_TIMEOUT_MIN"),
+		ElectionTimeoutMax: dur("RAFT_ELECTION_TIMEOUT_MAX"),
+		HeartbeatInterval:  dur("RAFT_HEARTBEAT_INTERVAL"),
+		TickInterval:       dur("RAFT_TICK_INTERVAL"),
+	}
 }
 
 func parsePeers(s string) (map[uint64]string, error) {

@@ -35,6 +35,27 @@ type DedupKey struct {
 	RequestID uint64
 }
 
+// Dedup-table bounds. The table is REPLICATED STATE (its contents change
+// command outcomes), so pruning must be a deterministic function of the
+// applied log — never wall-clock, never snapshot timing, which differ per
+// node. len(applied) after applying any log prefix is identical on every
+// replica, so a size-triggered sweep fires at the same log position
+// everywhere, and the delete predicate is order-independent.
+//
+// Semantic edge: a retry arriving more than dedupWindow requestIDs behind its
+// client's newest request re-executes instead of deduping. Real clients here
+// (loadgen workers, the traffic agent) only ever retry their most recent
+// request, so the window is never approached in practice.
+const (
+	// dedupWindow: keep results within this distance of a client's max seen
+	// requestID.
+	dedupWindow = 4096
+	// dedupHighWater: sweep when the table reaches this size. Without a bound
+	// the table grew one entry per write forever (~21.6M entries on the
+	// 6-day Oracle incident) and, once snapshots run, would bloat every one.
+	dedupHighWater = 16384
+)
+
 // WatchEvent is delivered to subscribers when a watched key changes.
 type WatchEvent struct {
 	Key   string
@@ -49,6 +70,9 @@ type Machine struct {
 
 	data    map[string][]byte
 	applied map[DedupKey]ApplyResult
+	// maxReq tracks each client's highest requestID seen, anchoring the
+	// deterministic dedup sweep (see the dedupWindow comment).
+	maxReq map[string]uint64
 
 	// watchers[key] holds channels that receive an event when key changes.
 	// We never block Apply on a slow watcher — sends are non-blocking drops.
@@ -60,6 +84,7 @@ func NewMachine() *Machine {
 	return &Machine{
 		data:     make(map[string][]byte),
 		applied:  make(map[DedupKey]ApplyResult),
+		maxReq:   make(map[string]uint64),
 		watchers: make(map[string][]chan WatchEvent),
 	}
 }
@@ -138,8 +163,26 @@ func (m *Machine) Apply(cmd Command) ApplyResult {
 		stored := res
 		stored.Duplicate = false
 		m.applied[DedupKey{cmd.ClientID, cmd.RequestID}] = stored
+		if cmd.RequestID > m.maxReq[cmd.ClientID] {
+			m.maxReq[cmd.ClientID] = cmd.RequestID
+		}
+		if len(m.applied) >= dedupHighWater {
+			m.sweepDedupLocked()
+		}
 	}
 	return res
+}
+
+// sweepDedupLocked drops dedup entries more than dedupWindow behind their
+// client's newest requestID. Deterministic given the applied log prefix —
+// every replica sweeps at the same log position with the same result.
+// Caller holds mu.
+func (m *Machine) sweepDedupLocked() {
+	for k := range m.applied {
+		if k.RequestID+dedupWindow < m.maxReq[k.Client] {
+			delete(m.applied, k)
+		}
+	}
 }
 
 // Get reads key from local state without going through Raft. Used by
@@ -186,6 +229,9 @@ func (m *Machine) notifyLocked(key string, value []byte, found bool) {
 type snapshotData struct {
 	Data    map[string][]byte
 	Applied map[DedupKey]ApplyResult
+	// MaxReq must ride along or a restored node would sweep differently
+	// than one that applied the whole log — replica divergence.
+	MaxReq map[string]uint64
 }
 
 // Snapshot exports the full machine state for Raft compaction.
@@ -207,8 +253,13 @@ func (m *Machine) Snapshot() ([]byte, error) {
 		}
 	}
 
+	maxReqCopy := make(map[string]uint64, len(m.maxReq))
+	for k, v := range m.maxReq {
+		maxReqCopy[k] = v
+	}
+
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(snapshotData{Data: dataCopy, Applied: appliedCopy}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(snapshotData{Data: dataCopy, Applied: appliedCopy, MaxReq: maxReqCopy}); err != nil {
 		return nil, fmt.Errorf("kv: encode snapshot: %w", err)
 	}
 	return buf.Bytes(), nil
@@ -224,11 +275,15 @@ func (m *Machine) Restore(raw []byte) error {
 	defer m.mu.Unlock()
 	m.data = snap.Data
 	m.applied = snap.Applied
+	m.maxReq = snap.MaxReq
 	if m.data == nil {
 		m.data = make(map[string][]byte)
 	}
 	if m.applied == nil {
 		m.applied = make(map[DedupKey]ApplyResult)
+	}
+	if m.maxReq == nil {
+		m.maxReq = make(map[string]uint64)
 	}
 	return nil
 }

@@ -89,9 +89,11 @@ func (n *Node) commitPropBatch(batch []propReq) {
 		n.failProps(batch)
 		return
 	}
+	// Wake the replicators so commit latency is one RTT, not one heartbeat.
+	// A batch landing while an RPC is in flight simply rides the next send.
+	n.notifyReplicatorsLocked()
 	n.mu.Unlock()
 
-	n.broadcastAppendEntries()
 	for i, req := range batch {
 		req.ch <- results[i]
 	}
@@ -165,7 +167,7 @@ func (n *Node) serveReadBatch(batch []readReq) {
 		n.mu.Lock()
 		// Lease covers a fraction of the election timeout so a partitioned
 		// leader cannot serve stale linearizable reads for long.
-		n.readLeaseUntil = time.Now().Add(electionTimeoutMin / 3)
+		n.readLeaseUntil = time.Now().Add(n.tm.ElectionTimeoutMin / 3)
 		stillLeader := n.role == Leader && n.currentTerm == term
 		if stillLeader && n.commitIndex > readIndex {
 			readIndex = n.commitIndex
@@ -273,13 +275,15 @@ func (n *Node) heartbeatAck(ctx context.Context, peer uint64, term uint64) bool 
 	if err != nil || resp == nil {
 		return false
 	}
-	if resp.Term > term {
-		n.mu.Lock()
-		if resp.Term > n.currentTerm {
-			n.becomeFollowerLocked(resp.Term)
-		}
+	n.mu.Lock()
+	if resp.Term > n.currentTerm {
+		n.becomeFollowerLocked(resp.Term)
 		n.mu.Unlock()
 		return false
 	}
+	if n.role == Leader && n.currentTerm == term {
+		n.noteContactLocked(peer) // answered: alive, whatever the answer
+	}
+	n.mu.Unlock()
 	return resp.Success && resp.Term == term
 }

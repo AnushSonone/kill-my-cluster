@@ -47,6 +47,9 @@ func main() {
 		fatalf("%v", err)
 	}
 	defer eng.Close()
+	// Self-healing beyond CP-initiated kills: crashed containers and
+	// CP-restart-orphaned outages come back within one reconcile tick.
+	eng.StartReconciler(5 * time.Second)
 
 	addr := env("HTTP_ADDR", "0.0.0.0:8080")
 	allowReset := strings.EqualFold(env("ALLOW_RESET", "false"), "true")

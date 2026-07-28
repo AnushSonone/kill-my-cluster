@@ -48,6 +48,14 @@ message RequestVoteRequest {
   // guarantees a new leader already holds every committed entry.
   uint64 last_log_index = 3;
   uint64 last_log_term = 4;
+  // Pre-vote (Raft thesis §9.6): when true, this is a non-binding poll — term
+  // is the term the candidate WOULD start, not one it has adopted. Voters
+  // answer without changing any state (no term bump, no votedFor, no timer
+  // reset), so a node that cannot win disturbs nobody. Only after a majority
+  // says "you could win" does the candidate start a real, term-bumping
+  // election. This is what stops an isolated node's inflated term from
+  // dethroning a healthy leader when it rejoins.
+  bool pre_vote = 5;
 }
 
 message RequestVoteResponse {

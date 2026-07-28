@@ -45,6 +45,11 @@ type Cluster struct {
 	// telemetry is optional; set via SetTelemetry for Prometheus.
 	telemetry Telemetry
 
+	// Auto-compaction cadence. Both fields are touched only by the applier
+	// goroutine (and NewCluster), so they need no locking.
+	snapEvery     uint64
+	lastSnapIndex uint64
+
 	stop     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -66,6 +71,15 @@ type Config struct {
 	Peers     []uint64
 	Dir       string
 	Transport raft.Transport
+	// Timings overrides Raft's protocol clocks; zero fields use defaults.
+	Timings raft.Timings
+	// SnapshotEntries: auto-compact the Raft log every N applied commands
+	// (0 = default 10000, ~7s of writes at demo load). Without this trigger
+	// the log grows forever: the 6-day Oracle incident reached 21.6M entries
+	// held in RAM, replayed in full on every restart.
+	SnapshotEntries uint64
+	// SnapshotRetain passes through to raft.Config.SnapshotRetain.
+	SnapshotRetain int
 }
 
 // NewCluster starts a Raft node and the goroutine that applies committed
@@ -75,18 +89,26 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	rn, err := raft.NewNode(raft.Config{
 		ID: cfg.ID, Peers: cfg.Peers, Dir: cfg.Dir,
 		Transport: cfg.Transport, ApplyCh: ch,
+		Timings:        cfg.Timings,
+		SnapshotRetain: cfg.SnapshotRetain,
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	snapEvery := cfg.SnapshotEntries
+	if snapEvery == 0 {
+		snapEvery = 10_000
+	}
+
 	c := &Cluster{
-		raft:    rn,
-		machine: NewMachine(),
-		applyCh: ch,
-		waiters: make(map[uint64]chan ApplyResult),
-		recent:  make(map[uint64]ApplyResult),
-		stop:    make(chan struct{}),
+		raft:      rn,
+		machine:   NewMachine(),
+		applyCh:   ch,
+		waiters:   make(map[uint64]chan ApplyResult),
+		recent:    make(map[uint64]ApplyResult),
+		snapEvery: snapEvery,
+		stop:      make(chan struct{}),
 	}
 	c.wg.Add(1)
 	go c.runApplier()
@@ -141,6 +163,9 @@ func (c *Cluster) handleApply(msg raft.ApplyMsg) {
 			// Log corruption would be catastrophic; panic is appropriate in dev.
 			panic(fmt.Sprintf("kv: restore snapshot at %d: %v", msg.SnapshotIndex, err))
 		}
+		// A received snapshot resets the compaction cadence: everything
+		// through its index is already compacted.
+		c.lastSnapIndex = msg.SnapshotIndex
 		return
 	}
 	if !msg.CommandValid {
@@ -165,16 +190,41 @@ func (c *Cluster) handleApply(msg raft.ApplyMsg) {
 		delete(c.waiters, msg.CommandIndex)
 		c.waitMu.Unlock()
 		ch <- res
+	} else {
+		c.recent[msg.CommandIndex] = res
+		// Bound memory: drop results far behind the applied index.
+		for idx := range c.recent {
+			if idx+256 < msg.CommandIndex {
+				delete(c.recent, idx)
+			}
+		}
+		c.waitMu.Unlock()
+	}
+
+	// Auto-compaction: runs on the applier goroutine, where machine state
+	// corresponds exactly to CommandIndex — no extra synchronization needed.
+	if c.snapEvery > 0 && msg.CommandIndex >= c.lastSnapIndex+c.snapEvery {
+		c.maybeSnapshotAt(msg.CommandIndex)
+	}
+}
+
+// maybeSnapshotAt captures the machine state at the just-applied index and
+// hands it to Raft for log compaction.
+func (c *Cluster) maybeSnapshotAt(applied uint64) {
+	// Caught-up gate: while replaying a large backlog (restart with a long
+	// WAL), skip — saveSnapshot rewrites the entire remaining WAL, which is
+	// pathological mid-replay. Snapshots resume once applied ≈ commit.
+	if c.raft.CommitIndex() > applied+c.snapEvery {
 		return
 	}
-	c.recent[msg.CommandIndex] = res
-	// Bound memory: drop results far behind the applied index.
-	for idx := range c.recent {
-		if idx+256 < msg.CommandIndex {
-			delete(c.recent, idx)
-		}
+	raw, err := c.machine.Snapshot()
+	if err != nil {
+		return // transient; the next trigger retries
 	}
-	c.waitMu.Unlock()
+	if err := c.raft.Snapshot(applied, raw); err != nil {
+		return
+	}
+	c.lastSnapIndex = applied
 }
 
 // propose encodes cmd, sends it through Raft, and waits for local apply.
@@ -309,16 +359,5 @@ func (c *Cluster) Unwatch(key string, ch chan WatchEvent) {
 	c.machine.Unwatch(key, ch)
 }
 
-// MaybeSnapshot compacts the Raft log if applied index >= minEntries since
-// the last snapshot. Called by tests/demo; production would trigger on size.
-func (c *Cluster) MaybeSnapshot() error {
-	idx := c.raft.CommitIndex()
-	if idx < 64 {
-		return nil
-	}
-	raw, err := c.machine.Snapshot()
-	if err != nil {
-		return err
-	}
-	return c.raft.Snapshot(idx, raw)
-}
+// (Manual MaybeSnapshot was removed: compaction now runs automatically from
+// the apply loop every SnapshotEntries commands — see maybeSnapshotAt.)

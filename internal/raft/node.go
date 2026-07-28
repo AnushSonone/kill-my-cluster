@@ -90,6 +90,49 @@ const (
 	tickInterval = 25 * time.Millisecond
 )
 
+// Timings holds the protocol clocks. The zero value means "use the defaults
+// above"; tests inject fast values, deployments tune via env without a
+// rebuild (cmd/node reads RAFT_ELECTION_TIMEOUT_MIN and friends).
+type Timings struct {
+	ElectionTimeoutMin time.Duration
+	ElectionTimeoutMax time.Duration
+	HeartbeatInterval  time.Duration
+	TickInterval       time.Duration
+}
+
+// DefaultTimings returns the production values.
+func DefaultTimings() Timings {
+	return Timings{
+		ElectionTimeoutMin: electionTimeoutMin,
+		ElectionTimeoutMax: electionTimeoutMax,
+		HeartbeatInterval:  heartbeatInterval,
+		TickInterval:       tickInterval,
+	}
+}
+
+// withDefaults fills zero fields and repairs inverted ranges. The spread
+// (Max-Min) must stay positive: the timer randomization calls rand.Int63n on
+// it, which panics on <= 0.
+func (t Timings) withDefaults() Timings {
+	d := DefaultTimings()
+	if t.ElectionTimeoutMin <= 0 {
+		t.ElectionTimeoutMin = d.ElectionTimeoutMin
+	}
+	if t.ElectionTimeoutMax <= t.ElectionTimeoutMin {
+		t.ElectionTimeoutMax = t.ElectionTimeoutMin + t.ElectionTimeoutMin/2
+		if t.ElectionTimeoutMax <= t.ElectionTimeoutMin {
+			t.ElectionTimeoutMax = t.ElectionTimeoutMin + time.Millisecond
+		}
+	}
+	if t.HeartbeatInterval <= 0 {
+		t.HeartbeatInterval = d.HeartbeatInterval
+	}
+	if t.TickInterval <= 0 {
+		t.TickInterval = d.TickInterval
+	}
+	return t
+}
+
 // ApplyMsg is delivered on the apply channel for every committed log entry
 // (CommandValid) or installed snapshot (SnapshotValid). The state machine —
 // Phase 3's KV store — consumes these; Raft itself never interprets commands.
@@ -126,6 +169,9 @@ type Node struct {
 	peers     []uint64 // IDs of the other nodes (not including self)
 	transport Transport
 	persist   *persister
+	tm        Timings // protocol clocks; immutable after NewNode
+	// snapshotRetain: entries kept behind a snapshot (see Config).
+	snapshotRetain uint64
 
 	// --- Persistent state (mirrored on disk before answering RPCs). ---
 	currentTerm uint64
@@ -143,6 +189,14 @@ type Node struct {
 	electionReset time.Time
 	// electionTimeout is re-randomized each time the timer is reset.
 	electionTimeout time.Duration
+	// electionAttempts counts consecutive failed pre-vote/election rounds
+	// since we last heard from a live leader. It widens the retry window
+	// (candidacy backoff) so a cluster that cannot elect — starved CPU,
+	// partition, split votes — probes gently instead of stampeding.
+	electionAttempts int
+	// preVoteRound stamps each pre-vote poll so responses from an abandoned
+	// round are recognized as history and dropped.
+	preVoteRound uint64
 
 	// --- Leader-only state, reinitialized on every election win (§5.3). ---
 	// nextIndex[peer]: index of the next entry to SEND to that peer (a guess,
@@ -150,6 +204,17 @@ type Node struct {
 	// KNOWN replicated on that peer (ground truth, only moves forward).
 	nextIndex  map[uint64]uint64
 	matchIndex map[uint64]uint64
+	// lastContact[peer]: when that peer last answered one of our RPCs while
+	// we led. CheckQuorum reads it: a leader that can't hear a majority for a
+	// full election timeout steps down instead of lingering as a zombie —
+	// required for the ReadIndex lease to stay honest, and doubly important
+	// now that stickiness makes deposing a zombie by force harder.
+	lastContact     map[uint64]time.Time
+	lastQuorumCheck time.Time
+	// repls holds this leadership's per-follower replication loops. Rebuilt
+	// with fresh notify channels on every election win; loops from an older
+	// term exit on their own via the (role, term) guards.
+	repls []*replState
 
 	// applyCh delivers committed entries to the state machine. applyCond
 	// wakes the applier goroutine whenever commitIndex advances.
@@ -208,6 +273,15 @@ type Config struct {
 	// ApplyCh receives committed commands and snapshots. The consumer must
 	// keep draining it; Raft blocks applying (never loses) if it stalls.
 	ApplyCh chan ApplyMsg
+	// Timings overrides the protocol clocks; zero fields use the defaults.
+	Timings Timings
+	// SnapshotRetain is how many committed entries to keep in the log BEHIND
+	// a snapshot point. Without a margin, every snapshot empties the log and
+	// any follower even one entry behind at that instant needs a full
+	// InstallSnapshot instead of a cheap AppendEntries — snapshot-flapping.
+	// 0 means the default (1024, ~0.7s of demo writes); negative keeps none
+	// (tests use this to force the InstallSnapshot path deterministically).
+	SnapshotRetain int
 }
 
 // NewNode recovers durable state from cfg.Dir and starts the node's
@@ -225,6 +299,7 @@ func NewNode(cfg Config) (*Node, error) {
 		peers:       cfg.Peers,
 		transport:   cfg.Transport,
 		persist:     p,
+		tm:          cfg.Timings.withDefaults(),
 		currentTerm: st.term,
 		votedFor:    st.votedFor,
 		log:         newRaftLog(st.snapIndex, st.snapTerm),
@@ -233,6 +308,15 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 	n.log.append(st.entries...)
+
+	switch {
+	case cfg.SnapshotRetain > 0:
+		n.snapshotRetain = uint64(cfg.SnapshotRetain)
+	case cfg.SnapshotRetain == 0:
+		n.snapshotRetain = 1024
+	default:
+		n.snapshotRetain = 0 // negative: compact fully (tests)
+	}
 
 	// A recovered snapshot is already-applied state: the state machine will
 	// receive it as its baseline, so both cursors start at the snapshot.
@@ -411,7 +495,10 @@ func (n *Node) WaitApplied(ctx context.Context, index uint64) bool {
 			return false
 		case <-n.done:
 			return false
-		case <-time.After(200 * time.Microsecond):
+		case <-time.After(time.Millisecond):
+			// 1ms poll: at 3000 reads/s the old 200µs poll cost thousands of
+			// extra mutex acquisitions per second on the same mutex the
+			// election timer and RPC handlers need.
 		}
 	}
 }
@@ -425,8 +512,24 @@ func (n *Node) WaitApplied(ctx context.Context, index uint64) bool {
 // start an election ourselves. Caller holds mu.
 func (n *Node) resetElectionTimerLocked() {
 	n.electionReset = time.Now()
-	n.electionTimeout = electionTimeoutMin +
-		time.Duration(rand.Int63n(int64(electionTimeoutMax-electionTimeoutMin)))
+	// Candidacy backoff: each consecutive failed round doubles the random
+	// spread (capped at 8x). The floor stays at ElectionTimeoutMin — we never
+	// get slower to NOTICE a dead leader, only less aggressive about
+	// re-campaigning when campaigns keep failing. Reset to 1x on any real
+	// leader contact or on winning.
+	spread := n.tm.ElectionTimeoutMax - n.tm.ElectionTimeoutMin
+	shift := min(n.electionAttempts, 3)
+	n.electionTimeout = n.tm.ElectionTimeoutMin +
+		time.Duration(rand.Int63n(int64(spread<<shift)))
+}
+
+// heardLeaderRecentlyLocked reports whether we believe a live leader exists:
+// we know who it is and it (or a vote we granted) touched our election clock
+// within the minimum election timeout. While true, elections are disruptions,
+// not repairs — pre-vote polls and higher-term vote requests are refused.
+// Caller holds mu.
+func (n *Node) heardLeaderRecentlyLocked() bool {
+	return n.leaderID != 0 && time.Since(n.electionReset) < n.tm.ElectionTimeoutMin
 }
 
 // runElectionTimer is the follower/candidate watchdog: if no heartbeat or
@@ -434,7 +537,7 @@ func (n *Node) resetElectionTimerLocked() {
 // leader is dead and stand for election.
 func (n *Node) runElectionTimer() {
 	defer n.wg.Done()
-	ticker := time.NewTicker(tickInterval)
+	ticker := time.NewTicker(n.tm.TickInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -443,8 +546,18 @@ func (n *Node) runElectionTimer() {
 			n.mu.Unlock()
 			return
 		}
-		// Leaders don't time out — they're the ones sending heartbeats.
+		// Leaders don't run election timeouts — but they do run CheckQuorum:
+		// if no majority has answered us within a full election timeout, the
+		// rest of the cluster has likely moved on (or we're partitioned).
+		// Step down quietly rather than linger as a zombie serving stale
+		// lease reads.
 		if n.role == Leader {
+			if time.Since(n.lastQuorumCheck) >= n.tm.ElectionTimeoutMax {
+				n.lastQuorumCheck = time.Now()
+				if !n.quorumActiveLocked() {
+					n.stepDownLocked()
+				}
+			}
 			n.mu.Unlock()
 			continue
 		}
@@ -452,8 +565,74 @@ func (n *Node) runElectionTimer() {
 			n.mu.Unlock()
 			continue
 		}
-		n.startElectionLocked()
+		n.startPreVoteLocked()
 		n.mu.Unlock()
+	}
+}
+
+// startPreVoteLocked polls the cluster with a NON-BINDING "could I win?"
+// question before any real election (Raft thesis §9.6). Nothing changes on
+// this node or the voters — no term bump, no votedFor, no fsync — so a node
+// that cannot win (partitioned, starved, out-of-date log) disturbs nobody,
+// and terms only advance when a majority already agrees the leader is gone.
+// This is the storm-breaker: under the old code every timeout burned a term
+// and an fsync on 7 nodes, and any node returning from a stall could dethrone
+// a healthy leader with its inflated term. Caller holds mu.
+func (n *Node) startPreVoteLocked() {
+	n.electionAttempts++
+	n.preVoteRound++
+	n.resetElectionTimerLocked() // schedule the next attempt (with backoff)
+
+	round := n.preVoteRound
+	term := n.currentTerm
+	lastIdx := n.log.lastIndex()
+	lastTerm := n.log.lastTerm()
+
+	// Count ourselves; a single-node cluster has nobody to poll or disturb,
+	// so it may proceed straight to the real election.
+	votes := 1
+	majority := (len(n.peers)+1)/2 + 1
+	if votes >= majority {
+		n.startElectionLocked()
+		return
+	}
+
+	for _, peer := range n.peers {
+		go func(peer uint64) {
+			req := &raftpb.RequestVoteRequest{
+				Term:         term + 1, // the term we WOULD start
+				CandidateId:  n.id,
+				LastLogIndex: lastIdx,
+				LastLogTerm:  lastTerm,
+				PreVote:      true,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), n.tm.ElectionTimeoutMax)
+			defer cancel()
+			resp, err := n.transport.RequestVote(ctx, peer, req)
+			if err != nil {
+				return // unreachable peer simply doesn't answer the poll
+			}
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			if n.stopped {
+				return
+			}
+			if resp.Term > n.currentTerm {
+				n.becomeFollowerLocked(resp.Term)
+				return
+			}
+			// Only act if this node is still the same follower running the
+			// same poll — an old round's answer is history, not information.
+			if n.role != Follower || n.currentTerm != term ||
+				n.preVoteRound != round || !resp.VoteGranted {
+				return
+			}
+			votes++
+			if votes == majority {
+				n.startElectionLocked()
+			}
+		}(peer)
 	}
 }
 
@@ -482,6 +661,11 @@ func (n *Node) startElectionLocked() {
 	// shared counter is guarded by n.mu.
 	votes := 1
 	majority := (len(n.peers)+1)/2 + 1
+	if votes >= majority {
+		// Single-node cluster: our own vote IS the majority.
+		n.becomeLeaderLocked()
+		return
+	}
 
 	for _, peer := range n.peers {
 		go func(peer uint64) {
@@ -493,7 +677,7 @@ func (n *Node) startElectionLocked() {
 			}
 			// The deadline bounds how long a vote request can dangle; a dead
 			// peer shouldn't hold RPC resources past the election's relevance.
-			ctx, cancel := context.WithTimeout(context.Background(), electionTimeoutMax)
+			ctx, cancel := context.WithTimeout(context.Background(), n.tm.ElectionTimeoutMax)
 			defer cancel()
 			resp, err := n.transport.RequestVote(ctx, peer, req)
 			if err != nil {
@@ -523,6 +707,42 @@ func (n *Node) startElectionLocked() {
 	}
 }
 
+// noteContactLocked records that a peer answered one of our RPCs while we
+// lead. Fed by every leader-side response path; consumed by CheckQuorum.
+// Caller holds mu.
+func (n *Node) noteContactLocked(peer uint64) {
+	if n.lastContact != nil {
+		n.lastContact[peer] = time.Now()
+	}
+}
+
+// quorumActiveLocked reports whether a majority (counting ourselves) has
+// answered us within the last full election timeout. Caller holds mu.
+func (n *Node) quorumActiveLocked() bool {
+	majority := (len(n.peers)+1)/2 + 1
+	count := 1 // self
+	for _, peer := range n.peers {
+		if time.Since(n.lastContact[peer]) < n.tm.ElectionTimeoutMax {
+			count++
+		}
+	}
+	return count >= majority
+}
+
+// stepDownLocked relinquishes leadership WITHOUT changing terms. This must
+// not reuse becomeFollowerLocked: that helper resets votedFor, and erasing
+// our own same-term vote (we voted for ourselves when elected) would let us
+// grant a second vote in this term — a double-vote safety hole. Here nothing
+// persistent changes: same term, same votedFor, no fsync. The heartbeat and
+// replication goroutines observe role != Leader and exit on their own.
+// Caller holds mu.
+func (n *Node) stepDownLocked() {
+	n.role = Follower
+	n.leaderID = 0
+	n.readLeaseUntil = time.Time{}
+	n.resetElectionTimerLocked()
+}
+
 // becomeFollowerLocked adopts a higher term and steps down. This is the
 // universal "someone knows more than us" reaction every RPC send/receive path
 // funnels through. Caller holds mu.
@@ -541,37 +761,85 @@ func (n *Node) becomeFollowerLocked(term uint64) {
 func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
 	n.leaderID = n.id
+	n.electionAttempts = 0 // campaigns work again; drop the backoff
 
 	// nextIndex starts optimistically at "just past my log" — the consistency
 	// check walks it back only as far as each follower actually needs (§5.3).
 	// matchIndex starts at 0: we KNOW nothing about followers until they ack.
 	n.nextIndex = make(map[uint64]uint64, len(n.peers))
 	n.matchIndex = make(map[uint64]uint64, len(n.peers))
+	n.lastContact = make(map[uint64]time.Time, len(n.peers))
+	now := time.Now()
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = n.log.lastIndex() + 1
 		n.matchIndex[peer] = 0
+		// Seed contact at "now" — a grace period so a freshly elected leader
+		// isn't deposed by CheckQuorum before its first heartbeats land.
+		n.lastContact[peer] = now
 	}
+	n.lastQuorumCheck = now
 
-	// Announce leadership immediately — the empty AppendEntries suppresses
-	// other nodes' election timers before they can fire.
-	go n.broadcastAppendEntries()
-
-	// And keep the heartbeat drumbeat going for as long as we lead.
 	// Clear any prior read lease — leadership is new.
 	n.readLeaseUntil = time.Time{}
 
-	n.wg.Add(1)
-	go n.runHeartbeats()
+	// One long-lived replicator loop per follower owns all sending for this
+	// leadership: announcement, heartbeats, entries, catch-up, snapshots.
+	// Its first pass fires immediately, announcing leadership before other
+	// nodes' election timers can go off.
+	n.repls = make([]*replState, 0, len(n.peers))
+	for _, peer := range n.peers {
+		rs := &replState{peer: peer, term: n.currentTerm, notify: make(chan struct{}, 1)}
+		n.repls = append(n.repls, rs)
+		n.wg.Add(1)
+		go n.runReplicator(rs)
+	}
 }
 
 // ---------------------------------------------------------------------------
 // RPC handlers (the receiving side of the protocol)
 // ---------------------------------------------------------------------------
 
-// HandleRequestVote decides whether to vote for a candidate (§5.2, §5.4.1).
+// HandleRequestVote decides whether to vote for a candidate (§5.2, §5.4.1),
+// or answers a non-binding pre-vote poll (thesis §9.6).
 func (n *Node) HandleRequestVote(req *raftpb.RequestVoteRequest) *raftpb.RequestVoteResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// A stopped node's persister is closed; an in-flight RPC that raced the
+	// shutdown must not touch it.
+	if n.stopped {
+		return &raftpb.RequestVoteResponse{Term: n.currentTerm}
+	}
+
+	// --- Pre-vote: answer WITHOUT touching any state. ---
+	// No term adoption, no votedFor, no fsync, no timer reset. Granting many
+	// pre-votes in one term is safe precisely because a grant binds nothing.
+	if req.PreVote {
+		resp := &raftpb.RequestVoteResponse{Term: n.currentTerm}
+		upToDate := req.LastLogTerm > n.log.lastTerm() ||
+			(req.LastLogTerm == n.log.lastTerm() && req.LastLogIndex >= n.log.lastIndex())
+		switch {
+		case req.Term <= n.currentTerm:
+			// The term it would start doesn't even beat ours.
+		case n.heardLeaderRecentlyLocked():
+			// Leader stickiness: our leader is alive; an election now would
+			// be disruption, not repair.
+		case !upToDate:
+			// It couldn't win the real election either (§5.4.1).
+		default:
+			resp.VoteGranted = true
+		}
+		return resp
+	}
+
+	// --- Real vote. ---
+	// Leader stickiness, second layer: refuse to even ADOPT a higher term
+	// while our leader is demonstrably alive. Without this, one disruptive
+	// candidate (or a legacy/raw RequestVote) still dethrones a healthy
+	// leader the moment its term is bigger.
+	if req.Term > n.currentTerm && n.heardLeaderRecentlyLocked() {
+		return &raftpb.RequestVoteResponse{Term: n.currentTerm}
+	}
 
 	if req.Term > n.currentTerm {
 		n.becomeFollowerLocked(req.Term)
@@ -626,6 +894,11 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// Shutdown race guard: the persister is closed once stopped.
+	if n.stopped {
+		return &raftpb.AppendEntriesResponse{Term: n.currentTerm}
+	}
+
 	if req.Term > n.currentTerm {
 		n.becomeFollowerLocked(req.Term)
 	}
@@ -643,6 +916,7 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 	// lost — stand down.
 	n.role = Follower
 	n.leaderID = req.LeaderId
+	n.electionAttempts = 0 // real leader contact; drop any candidacy backoff
 	n.resetElectionTimerLocked()
 
 	// --- Consistency check (the Log Matching enforcement, §5.3). ---
@@ -735,6 +1009,11 @@ func (n *Node) HandleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// Shutdown race guard: the persister is closed once stopped.
+	if n.stopped {
+		return &raftpb.InstallSnapshotResponse{Term: n.currentTerm}
+	}
+
 	if req.Term > n.currentTerm {
 		n.becomeFollowerLocked(req.Term)
 	}
@@ -745,6 +1024,7 @@ func (n *Node) HandleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb
 
 	n.role = Follower
 	n.leaderID = req.LeaderId
+	n.electionAttempts = 0 // real leader contact; drop any candidacy backoff
 	n.resetElectionTimerLocked()
 
 	// A snapshot older than our commit point adds nothing (a delayed or
@@ -797,13 +1077,39 @@ func (n *Node) Snapshot(index uint64, data []byte) error {
 	if index > n.lastApplied {
 		return fmt.Errorf("raft: cannot snapshot at %d beyond lastApplied %d", index, n.lastApplied)
 	}
-	term, ok := n.log.term(index)
+	// Capture the snapshot point's term BEFORE compaction can discard it.
+	snapTerm, ok := n.log.term(index)
 	if !ok {
 		return fmt.Errorf("raft: snapshot index %d not in log", index)
 	}
 
-	n.log.compactTo(index, term)
-	return n.persist.saveSnapshot(index, term, data, n.currentTerm, n.votedFor, n.log.allEntries())
+	// Compact only to index-retain: the snapshot file covers through index,
+	// but a small tail of already-snapshotted entries stays in the log so
+	// followers a few entries behind keep using cheap AppendEntries instead
+	// of full snapshot transfers. The margin evaporates on restart (recovery
+	// drops replayed entries at or below the snapshot index) — harmless.
+	cut := index
+	if n.snapshotRetain > 0 {
+		if index > n.snapshotRetain {
+			cut = index - n.snapshotRetain
+		} else {
+			cut = 0
+		}
+	}
+	if cut > n.log.firstIndex() {
+		if cutTerm, ok := n.log.term(cut); ok {
+			n.log.compactTo(cut, cutTerm)
+		}
+	}
+	return n.persist.saveSnapshot(index, snapTerm, data, n.currentTerm, n.votedFor, n.log.allEntries())
+}
+
+// FirstIndex returns the log's compaction point (0 if never compacted).
+// Introspection for tests and dashboards.
+func (n *Node) FirstIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.log.firstIndex()
 }
 
 // ---------------------------------------------------------------------------

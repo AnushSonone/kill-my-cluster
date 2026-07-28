@@ -118,3 +118,26 @@ func TestWatch(t *testing.T) {
 		t.Fatal("expected watch event")
 	}
 }
+
+// TestDedupSweepBounded pins the deterministic dedup bound: the table must
+// stay near dedupHighWater under unbounded distinct requests, recent retries
+// must still dedup, and requests older than the window re-execute (the
+// documented trade-off).
+func TestDedupSweepBounded(t *testing.T) {
+	m := NewMachine()
+	total := dedupHighWater + dedupWindow + 100
+	for i := 1; i <= total; i++ {
+		m.Apply(Command{Op: OpPut, ClientID: "c", RequestID: uint64(i), Key: "k", Value: []byte("v")})
+	}
+	if len(m.applied) > dedupHighWater {
+		t.Fatalf("dedup table %d entries; bound is %d", len(m.applied), dedupHighWater)
+	}
+	res := m.Apply(Command{Op: OpPut, ClientID: "c", RequestID: uint64(total), Key: "k", Value: []byte("x")})
+	if !res.Duplicate {
+		t.Fatal("recent retry was not deduped")
+	}
+	res = m.Apply(Command{Op: OpPut, ClientID: "c", RequestID: 1, Key: "k", Value: []byte("y")})
+	if res.Duplicate {
+		t.Fatal("out-of-window retry claimed Duplicate; sweep should have dropped it")
+	}
+}

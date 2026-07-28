@@ -7,12 +7,15 @@ package kv
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/AnushSonone/kill-my-cluster/internal/kvpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // Client talks to a multi-node KV cluster over gRPC.
@@ -123,7 +126,13 @@ func (c *Client) viaLeader(ctx context.Context, fn func(kvpb.KVClient) (notLeade
 			}
 			notLeader, hint, err := fn(stub)
 			if err != nil {
-				c.invalidate(id)
+				// Tear the connection down only when it is actually broken.
+				// A DeadlineExceeded from a slow-but-alive node used to close
+				// and re-dial the session — handshake churn against a cluster
+				// that is already struggling.
+				if status.Code(err) == codes.Unavailable {
+					c.invalidate(id)
+				}
 				continue
 			}
 			if notLeader {
@@ -134,7 +143,16 @@ func (c *Client) viaLeader(ctx context.Context, fn func(kvpb.KVClient) (notLeade
 			}
 			return nil
 		}
-		time.Sleep(40 * time.Millisecond)
+		// A full sweep found no leader: the cluster is mid-election. Back off
+		// with jitter (250-500ms, roughly an election round) instead of the
+		// old 40ms hammer — during an outage every caller re-walking all
+		// peers every 40ms was itself a meaningful load source.
+		wait := 250*time.Millisecond + time.Duration(rand.Int63n(int64(250*time.Millisecond)))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
 	}
 	return fmt.Errorf("kv: no leader available")
 }
