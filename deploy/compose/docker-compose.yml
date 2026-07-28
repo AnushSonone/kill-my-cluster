@@ -180,7 +180,9 @@ services:
       context: ../..
       dockerfile: Dockerfile.loadgen
     container_name: kmc-loadgen
-    cpus: 0.3
+    # 0.6 not 0.3: at 0.3 the client itself throttled the demo (~87% of its
+    # budget driving 96 workers) while the cluster had headroom.
+    cpus: 0.6
     logging: *kmc-logging
     environment:
       KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
