@@ -9,14 +9,18 @@ services:
   web:
     profiles: ["local-ui"]
 
-  # Oracle ladder 2026-07-21: peak sustained ~1413w/3233r (C5) with term flat
-  # on 4 OCPU. Promote below peak for kill-headroom.
+  # Re-balanced 2026-07-28 for the post-incident CPU caps (nodes 0.45 each):
+  # 128 read workers saturated the capped leader and starved the write path
+  # to ~25w/s (write p50 hit 2.5s+ with zero errors). Measured with this mix:
+  # ~640w/s + ~850r/s sustained, term flat, no errors. The old uncapped
+  # ladder peak (~1413w/3233r, 2026-07-21) is not reachable under caps;
+  # re-ladder if the headline number matters.
   loadgen:
     environment:
       WRITE_QPS: "1400"
-      READ_QPS: "3000"
+      READ_QPS: "2000"
       WRITE_WORKERS: "64"
-      READ_WORKERS: "128"
+      READ_WORKERS: "32"
 
   prometheus:
     ports: !override []
