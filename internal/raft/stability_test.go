@@ -451,14 +451,16 @@ func TestIdleLeaderDoesNotStepDown(t *testing.T) {
 	}
 }
 
-// TestHealedFollowerCatchesUpWithoutSnapshot pins the retention invariant. A
-// node that comes back after a heal must be repairable with ordinary
-// AppendEntries. With the old 1024-entry default against a 10s heal at demo
-// load, every healed node landed past the compaction point and forced a full
-// InstallSnapshot — three at once wedged the leader in production.
+// TestHealedFollowerCatchesUpWithoutSnapshot pins the mechanism retention
+// exists for: when the margin DOES cover the gap, a healed node is repaired
+// with ordinary AppendEntries and costs no InstallSnapshot at all.
+//
+// Production runs the small default and deliberately eats the snapshot on
+// heal — see the cost table on Config.SnapshotRetain. This test is about the
+// code path being correct, not about the deployed number.
 func TestHealedFollowerCatchesUpWithoutSnapshot(t *testing.T) {
 	c := newTestClusterTuned(t, 3, func(cfg *Config) {
-		cfg.SnapshotRetain = 4096 // a real margin, as production now runs
+		cfg.SnapshotRetain = 4096 // margin larger than the gap this test makes
 	})
 	defer c.stop()
 

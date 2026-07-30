@@ -11,8 +11,9 @@
 //	KV_PEERS=1=node1:8000,2=node2:8000,...   # all KV endpoints (for traffic agent)
 //	RUN_AGENT=true                           # only one node should set this
 //	SNAPSHOT_ENTRIES=10000                   # auto-compact every N applies
-//	SNAPSHOT_RETAIN=32768                    # entries kept behind the snapshot;
-//	                                         # must exceed HEAL_AFTER x write rate
+//	SNAPSHOT_RETAIN=1024                     # entries kept behind the snapshot;
+//	                                         # raising it costs throughput, see
+//	                                         # SnapshotRetain in internal/raft
 //	RAFT_COMMIT_STALL_TIMEOUT=30s            # leader self-deposes after this
 //	                                         # long with no commit progress
 //	                                         # (negative disables the watchdog)
@@ -174,11 +175,10 @@ func loadConfig() (config, error) {
 	}, nil
 }
 
-// loadSnapshotRetain reads SNAPSHOT_RETAIN (0/unset = raft default of 32768).
-// Retention must exceed HEAL_AFTER x peak write rate or every healed node
-// lands past the tail and forces a full InstallSnapshot — see the
-// SnapshotRetain doc in internal/raft. Negative is passed through: it means
-// "keep nothing", which tests rely on.
+// loadSnapshotRetain reads SNAPSHOT_RETAIN (0/unset = raft default of 1024).
+// Raising it is measurably expensive on a CPU-capped box — see the cost table
+// on SnapshotRetain in internal/raft before changing it. Negative is passed
+// through: it means "keep nothing", which tests rely on.
 func loadSnapshotRetain() int {
 	v := os.Getenv("SNAPSHOT_RETAIN")
 	if v == "" {
