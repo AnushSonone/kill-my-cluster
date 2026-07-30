@@ -328,20 +328,25 @@ type Config struct {
 	// InstallSnapshot instead of a cheap AppendEntries — snapshot-flapping.
 	//
 	// DELIBERATELY SMALL — raising this is not free. Measured on the Oracle
-	// A1 (4 OCPU, nodes capped at 0.45) against a 1165 w/s / 1508 r/s
-	// baseline at retain=1024, snapEvery=10000:
+	// A1 (4 OCPU, nodes capped at 0.45), 2026-07-30:
 	//
 	//	retain  snapEvery  writes/s  reads/s
-	//	  1024      10000      1165     1508   <- baseline
-	//	 32768      10000       903      600   <- WAL rewrite amplification
-	//	 16384     100000       940      775   <- amplification fixed, still slow
+	//	  1024      10000      1034     1275   <- shipped
+	//	 32768      10000       903      605
+	//	 16384     100000       930      765
+	//
+	// Caveat on those two rows: each was sampled ~9 minutes after a redeploy.
+	// This cluster takes ~10 minutes to settle after a restart (reads were
+	// seen climbing 950 -> 1275 on an UNCHANGED config), so treat them as
+	// indicative, not exact. The 1024 row is a settled back-to-back window
+	// against the pre-change build, which measured 1039 w/s / 1202 r/s.
 	//
 	// Two independent costs, and you cannot dodge both: saveSnapshot rewrites
 	// the whole retained tail, so retain/snapEvery is a write-amplification
 	// ratio; and the retained entries stay in RAM on the scan paths that run
 	// under the node mutex, so snapEvery+retain is a latency cost. Sizing
 	// retention above HEAL_AFTER x write rate (~11.6k entries at demo load)
-	// requires losing 20-50% throughput to one or the other.
+	// pays one or the other.
 	//
 	// So a healed node DOES still land past the tail and take a full
 	// InstallSnapshot. That is fine now: the snapshot is served from an
