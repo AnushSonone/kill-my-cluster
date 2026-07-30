@@ -43,6 +43,10 @@ type testCluster struct {
 	// test's background proposer) reads them while the main test goroutine
 	// stops/boots nodes.
 	nodesMu sync.Mutex
+	// cfgTweak, if set, adjusts each node's Config just before NewNode. It is
+	// reapplied on restartNode, so a tuned cluster stays tuned across a
+	// stop/start cycle.
+	cfgTweak func(*Config)
 }
 
 // liveNodes returns a snapshot of the current node pointers, safe to use
@@ -61,11 +65,19 @@ func (c *testCluster) liveNodes() []*Node {
 
 func newTestCluster(t *testing.T, nNodes int) *testCluster {
 	t.Helper()
+	return newTestClusterTuned(t, nNodes, nil)
+}
+
+// newTestClusterTuned is newTestCluster with a hook to override each node's
+// Config — used by tests that need a specific CommitStallTimeout or a real
+// SnapshotRetain margin instead of the suite defaults.
+func newTestClusterTuned(t *testing.T, nNodes int, tweak func(*Config)) *testCluster {
+	t.Helper()
 	if nNodes < 3 {
 		t.Fatalf("need at least 3 nodes, got %d", nNodes)
 	}
 
-	c := &testCluster{t: t}
+	c := &testCluster{t: t, cfgTweak: tweak}
 	base := t.TempDir()
 	c.addrs = make(map[uint64]string, nNodes)
 	c.dirs = make([]string, nNodes)
@@ -117,14 +129,18 @@ func (c *testCluster) bootNode(i int, lis net.Listener) {
 
 	transport := NewGRPCTransport(peerAddrs)
 	gate := &gateTransport{inner: transport}
-	node, err := NewNode(Config{
+	cfg := Config{
 		ID: id, Peers: peers, Dir: c.dirs[i],
 		Transport: gate, ApplyCh: ch,
 		Timings: testTimings(),
 		// No retention margin: these tests drive Node.Snapshot at tiny
 		// indices and assert real compaction + InstallSnapshot behavior.
 		SnapshotRetain: -1,
-	})
+	}
+	if c.cfgTweak != nil {
+		c.cfgTweak(&cfg)
+	}
+	node, err := NewNode(cfg)
 	if err != nil {
 		t.Fatalf("node %d: %v", id, err)
 	}

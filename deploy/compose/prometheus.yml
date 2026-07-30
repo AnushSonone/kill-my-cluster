@@ -2,6 +2,12 @@ global:
   scrape_interval: 1s
   evaluation_interval: 1s
 
+# Progress alerts. See rules/kmc.yml for why they exist (the 2026-07-28 wedge
+# ran for 48h with every target green). Alertmanager is not deployed, so these
+# surface in the Prometheus UI and Grafana only.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
 scrape_configs:
   - job_name: kill-my-cluster
     static_configs:

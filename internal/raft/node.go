@@ -88,6 +88,19 @@ const (
 
 	// How often the election-timer goroutine wakes up to check the clock.
 	tickInterval = 25 * time.Millisecond
+
+	// How long a leader may hold uncommitted work without commitIndex moving
+	// before it deposes itself. See the commit-stall watchdog in
+	// runElectionTimer: CheckQuorum proves we can still be HEARD, this proves
+	// we can still make PROGRESS.
+	//
+	// Deliberately generous. A 15-minute local kill-churn soak at 10s produced
+	// one false positive: under heavy CPU starvation a leader missed the
+	// 10s window and was deposed, costing an extra election during load it
+	// would have ridden out. The failure this defends against ran for 48
+	// HOURS, so 30s versus 10s is irrelevant to recovery time while tripling
+	// the margin against transient starvation. When in doubt, be slower.
+	commitStallTimeout = 30 * time.Second
 )
 
 // Timings holds the protocol clocks. The zero value means "use the defaults
@@ -98,6 +111,10 @@ type Timings struct {
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
 	TickInterval       time.Duration
+	// CommitStallTimeout bounds how long a leader may sit on uncommitted
+	// entries without commitIndex advancing. Zero means the default; NEGATIVE
+	// disables the watchdog entirely (same convention as SnapshotRetain).
+	CommitStallTimeout time.Duration
 }
 
 // DefaultTimings returns the production values.
@@ -107,6 +124,7 @@ func DefaultTimings() Timings {
 		ElectionTimeoutMax: electionTimeoutMax,
 		HeartbeatInterval:  heartbeatInterval,
 		TickInterval:       tickInterval,
+		CommitStallTimeout: commitStallTimeout,
 	}
 }
 
@@ -129,6 +147,11 @@ func (t Timings) withDefaults() Timings {
 	}
 	if t.TickInterval <= 0 {
 		t.TickInterval = d.TickInterval
+	}
+	// Only zero takes the default here: a negative value is a deliberate
+	// "disable the watchdog" and must survive.
+	if t.CommitStallTimeout == 0 {
+		t.CommitStallTimeout = d.CommitStallTimeout
 	}
 	return t
 }
@@ -157,6 +180,17 @@ type Transport interface {
 	InstallSnapshot(ctx context.Context, peer uint64, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error)
 }
 
+// snapshotCache is the last snapshot this node persisted, held in memory so
+// the leader can ship it without a disk read while holding mu. Shipping used
+// to call persist.readSnapshot() under the mutex; with several followers past
+// the compaction point at once, those reads serialized every propose and
+// ReadIndex on the leader behind them — half of the 2026-07-28 wedge.
+type snapshotCache struct {
+	index uint64
+	term  uint64
+	data  []byte
+}
+
 // Node is one member of a Raft cluster.
 type Node struct {
 	// mu guards every mutable field below. Raft is notoriously easy to get
@@ -172,6 +206,9 @@ type Node struct {
 	tm        Timings // protocol clocks; immutable after NewNode
 	// snapshotRetain: entries kept behind a snapshot (see Config).
 	snapshotRetain uint64
+	// snapCache mirrors the on-disk snapshot so InstallSnapshot sends never
+	// touch the disk while mu is held.
+	snapCache snapshotCache
 
 	// --- Persistent state (mirrored on disk before answering RPCs). ---
 	currentTerm uint64
@@ -211,6 +248,16 @@ type Node struct {
 	// now that stickiness makes deposing a zombie by force harder.
 	lastContact     map[uint64]time.Time
 	lastQuorumCheck time.Time
+	// Commit-stall watchdog. CheckQuorum above proves followers still ANSWER
+	// us; these prove our log still MOVES. A leader whose replicators are
+	// wedged keeps heartbeating (so CheckQuorum is satisfied) while committing
+	// nothing, and PreVote + stickiness stop anyone else from deposing it —
+	// the 2026-07-28 outage sat exactly there for 48 hours. lastProgressIndex
+	// is the commitIndex as of lastCommitProgress; both are seeded on election
+	// win and updated whenever commitIndex actually advances.
+	lastCommitProgress   time.Time
+	lastProgressIndex    uint64
+	commitStallStepdowns uint64 // cumulative, for telemetry
 	// repls holds this leadership's per-follower replication loops. Rebuilt
 	// with fresh notify channels on every election win; loops from an older
 	// term exit on their own via the (role, term) guards.
@@ -279,8 +326,19 @@ type Config struct {
 	// a snapshot point. Without a margin, every snapshot empties the log and
 	// any follower even one entry behind at that instant needs a full
 	// InstallSnapshot instead of a cheap AppendEntries — snapshot-flapping.
-	// 0 means the default (1024, ~0.7s of demo writes); negative keeps none
-	// (tests use this to force the InstallSnapshot path deterministically).
+	//
+	// SIZE IT ABOVE THE HEAL WINDOW: retention must exceed
+	// HEAL_AFTER x peak write rate, or every healed node lands past the tail
+	// and is forced onto the snapshot path. The old 1024 default was ~0.7s of
+	// demo writes against a 10s heal, so a killed node came back ~11.6k
+	// entries behind and ALWAYS needed a full transfer; three of them at once
+	// wedged the leader for 48 hours on 2026-07-28. Same class of mistake as
+	// the dedup bound in machine.go: a limit that ignores the rate it has to
+	// absorb.
+	//
+	// 0 means the default (32768, ~2x the 10s heal at the 1400 w/s ceiling);
+	// negative keeps none (tests use this to force the InstallSnapshot path
+	// deterministically).
 	SnapshotRetain int
 }
 
@@ -313,7 +371,7 @@ func NewNode(cfg Config) (*Node, error) {
 	case cfg.SnapshotRetain > 0:
 		n.snapshotRetain = uint64(cfg.SnapshotRetain)
 	case cfg.SnapshotRetain == 0:
-		n.snapshotRetain = 1024
+		n.snapshotRetain = 32768
 	default:
 		n.snapshotRetain = 0 // negative: compact fully (tests)
 	}
@@ -556,8 +614,11 @@ func (n *Node) runElectionTimer() {
 				n.lastQuorumCheck = time.Now()
 				if !n.quorumActiveLocked() {
 					n.stepDownLocked()
+					n.mu.Unlock()
+					continue
 				}
 			}
+			n.checkCommitStallLocked()
 			n.mu.Unlock()
 			continue
 		}
@@ -729,6 +790,72 @@ func (n *Node) quorumActiveLocked() bool {
 	return count >= majority
 }
 
+// noteCommitProgressLocked records that commitIndex just moved. Fed by
+// maybeAdvanceCommitLocked; consumed by the commit-stall watchdog. Caller
+// holds mu.
+func (n *Node) noteCommitProgressLocked() {
+	n.lastCommitProgress = time.Now()
+	n.lastProgressIndex = n.commitIndex
+}
+
+// checkCommitStallLocked deposes this leader if it is holding uncommitted
+// entries that have stopped making progress, despite a reachable majority.
+//
+// CheckQuorum cannot catch this. A leader whose per-follower replicators are
+// wedged still exchanges heartbeats, so quorumActiveLocked stays true forever
+// while commitIndex never moves — and PreVote plus leader stickiness actively
+// stop a healthy follower from taking over. Stepping down is the only exit,
+// and it is the one a human performed by hand (killing the leader container)
+// to end the 2026-07-28 outage after 48 hours.
+//
+// Three conditions must ALL hold, and the first is the load-bearing one:
+//
+//  1. Uncommitted work exists. An idle cluster makes no commit progress by
+//     definition; without this guard the watchdog would depose the leader on
+//     every quiet period and produce exactly the election churn the PreVote
+//     work was written to prevent.
+//  2. No progress for the full CommitStallTimeout.
+//  3. A majority is still answering us. If it is not, this is an ordinary
+//     partition and CheckQuorum above already owns the response.
+//
+// Caller holds mu.
+func (n *Node) checkCommitStallLocked() {
+	if n.tm.CommitStallTimeout < 0 {
+		return // watchdog disabled
+	}
+	if n.log.lastIndex() <= n.commitIndex {
+		// Nothing pending: fully caught up, or idle. Keep the clock fresh so
+		// the first proposal after a quiet spell gets a full timeout.
+		n.noteCommitProgressLocked()
+		return
+	}
+	if n.lastCommitProgress.IsZero() || n.commitIndex != n.lastProgressIndex {
+		// Commit moved since we last looked. Compare the index rather than
+		// trusting every commit path to call the hook: this way a future path
+		// that advances commitIndex without notifying cannot make the watchdog
+		// fire on a cluster that is in fact healthy.
+		n.noteCommitProgressLocked()
+		return
+	}
+	if time.Since(n.lastCommitProgress) < n.tm.CommitStallTimeout {
+		return
+	}
+	if !n.quorumActiveLocked() {
+		return // unreachable majority is CheckQuorum's problem, not ours
+	}
+	n.commitStallStepdowns++
+	n.stepDownLocked()
+}
+
+// CommitStallStepdowns reports how many times this node has deposed itself for
+// lack of commit progress. Cumulative for the process lifetime; surfaced as a
+// gauge so a wedge that recurs is visible instead of silent.
+func (n *Node) CommitStallStepdowns() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitStallStepdowns
+}
+
 // stepDownLocked relinquishes leadership WITHOUT changing terms. This must
 // not reuse becomeFollowerLocked: that helper resets votedFor, and erasing
 // our own same-term vote (we voted for ourselves when elected) would let us
@@ -778,6 +905,10 @@ func (n *Node) becomeLeaderLocked() {
 		n.lastContact[peer] = now
 	}
 	n.lastQuorumCheck = now
+	// Seed the stall clock for the same reason lastContact is seeded above: a
+	// brand-new leader must not be deposed for a stall it inherited.
+	n.lastCommitProgress = now
+	n.lastProgressIndex = n.commitIndex
 
 	// Clear any prior read lease — leadership is new.
 	n.readLeaseUntil = time.Time{}
@@ -1043,6 +1174,9 @@ func (n *Node) HandleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb
 	); err != nil {
 		return resp
 	}
+	// Keep the cache in step so this node can ship the snapshot straight from
+	// memory if it is elected later.
+	n.snapCache = snapshotCache{index: req.LastIncludedIndex, term: req.LastIncludedTerm, data: req.Data}
 
 	// The snapshot IS applied state: jump both cursors to it and queue it for
 	// the state machine, which must load it before consuming further entries.
@@ -1101,7 +1235,14 @@ func (n *Node) Snapshot(index uint64, data []byte) error {
 			n.log.compactTo(cut, cutTerm)
 		}
 	}
-	return n.persist.saveSnapshot(index, snapTerm, data, n.currentTerm, n.votedFor, n.log.allEntries())
+	if err := n.persist.saveSnapshot(index, snapTerm, data, n.currentTerm, n.votedFor, n.log.allEntries()); err != nil {
+		return err
+	}
+	// Serve future InstallSnapshot sends from here instead of from disk. The
+	// caller hands us a freshly serialized image each time and does not retain
+	// it, so keeping the reference is safe.
+	n.snapCache = snapshotCache{index: index, term: snapTerm, data: data}
+	return nil
 }
 
 // FirstIndex returns the log's compaction point (0 if never compacted).

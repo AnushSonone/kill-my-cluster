@@ -211,10 +211,18 @@ func (n *Node) replicateOnce(peer uint64, term uint64) (again, alive bool) {
 // predates our earliest retained log entry. Caller holds mu; this function
 // releases it around the RPC. Return values follow replicateOnce's contract.
 func (n *Node) sendSnapshotLocked(peer uint64, term uint64) (again, alive bool) {
-	snapIdx, snapTerm, data, err := n.persist.readSnapshot()
-	if err != nil || snapIdx == 0 {
-		n.mu.Unlock()
-		return false, true // nothing to ship yet; wait for a tick
+	// Take the image from memory: a pointer copy, no disk I/O under mu. The
+	// disk fallback covers the window after a restart, before this node has
+	// saved or received a snapshot of its own.
+	snapIdx, snapTerm, data := n.snapCache.index, n.snapCache.term, n.snapCache.data
+	if snapIdx == 0 {
+		var err error
+		snapIdx, snapTerm, data, err = n.persist.readSnapshot()
+		if err != nil || snapIdx == 0 {
+			n.mu.Unlock()
+			return false, true // nothing to ship yet; wait for a tick
+		}
+		n.snapCache = snapshotCache{index: snapIdx, term: snapTerm, data: data}
 	}
 	req := &raftpb.InstallSnapshotRequest{
 		Term:              term,
@@ -284,6 +292,7 @@ func (n *Node) maybeAdvanceCommitLocked() {
 		}
 		if count >= majority {
 			n.commitIndex = idx
+			n.noteCommitProgressLocked() // feeds the commit-stall watchdog
 			n.applyCond.Broadcast()
 			// Tell the replicators now, so followers learn the new
 			// commitIndex within one RTT instead of one heartbeat.

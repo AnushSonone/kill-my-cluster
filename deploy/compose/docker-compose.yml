@@ -272,6 +272,7 @@ services:
       - --web.console.templates=/usr/share/prometheus/consoles
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./rules:/etc/prometheus/rules:ro
       - prom-data:/prometheus
     ports:
       - "9090:9090"

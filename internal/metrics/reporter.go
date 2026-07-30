@@ -13,6 +13,7 @@ type RaftSource interface {
 	Role() raft.Role
 	CommitIndex() uint64
 	LeaderID() uint64
+	CommitStallStepdowns() uint64
 }
 
 // Reporter periodically copies Raft state into Prometheus gauges.
@@ -48,4 +49,5 @@ func (r *Reporter) Run(ctx context.Context) {
 func (r *Reporter) sample() {
 	term, isLeader := r.src.Status()
 	r.col.SetRaft(term, isLeader, RoleInt(r.src.Role().String()), r.src.CommitIndex(), r.src.LeaderID())
+	r.col.SetCommitStallStepdowns(r.src.CommitStallStepdowns())
 }

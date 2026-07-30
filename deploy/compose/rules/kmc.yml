@@ -1,0 +1,64 @@
+# Alert rules for kill-my-cluster.
+#
+# These exist because of the 2026-07-28 outage: a visitor killed three of seven
+# machines, they healed on schedule, and the cluster then served zero writes and
+# zero reads for 48 hours. Every container stayed up, every scrape target stayed
+# green, the Raft term never moved, and the public demo showed 0/0 to everyone
+# who visited. Nothing alerted, because nothing was watching for PROGRESS.
+#
+# NOTE: Alertmanager is NOT deployed. These rules fire visibly in the Prometheus
+# UI (/alerts) and drive the Grafana panel, but they will not notify anyone.
+# Routing is separate, unfinished work.
+
+groups:
+  - name: kmc-progress
+    interval: 15s
+    rules:
+      # The single rule that would have caught the whole incident in minutes.
+      # Applies are the state machine actually doing work; if this is flat while
+      # the cluster is up, the demo is dead no matter how healthy it looks.
+      - alert: KmcNoApplyProgress
+        expr: sum(rate(kmc_kv_applies_total[2m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Raft cluster is applying nothing"
+          description: >-
+            No committed commands have been applied anywhere in the cluster for
+            5 minutes while nodes are up and being scraped. This is the
+            2026-07-28 wedge signature. Check whether a leader exists and
+            whether kmc_raft_commit_index is advancing; killing the leader
+            clears a wedged replicator.
+
+      # Narrower and faster: a leader exists, so this is not an election gap,
+      # yet the commit index is frozen.
+      - alert: KmcLeaderNotCommitting
+        expr: |
+          max(kmc_raft_is_leader) == 1
+          and
+          sum(rate(kmc_raft_commit_index[2m])) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Leader is elected but commit index is frozen"
+          description: >-
+            A leader holds office and heartbeats are keeping it there, but
+            commitIndex has not advanced for 2 minutes. The commit-stall
+            watchdog should have deposed it after RAFT_COMMIT_STALL_TIMEOUT; if
+            this is firing, the watchdog is disabled or not working.
+
+      # The watchdog firing at all is worth knowing about: once is a rescue,
+      # repeatedly means the timeout is too aggressive or a node is unhealthy.
+      - alert: KmcCommitStallWatchdogFiring
+        expr: changes(kmc_raft_commit_stall_stepdowns[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A leader deposed itself for lack of commit progress"
+          description: >-
+            node_id {{ $labels.node_id }} hit the commit-stall watchdog. One
+            occurrence means it did its job. Repeated occurrences under normal
+            load mean RAFT_COMMIT_STALL_TIMEOUT is too short.

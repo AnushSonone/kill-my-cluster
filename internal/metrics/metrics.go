@@ -24,6 +24,10 @@ type Collector struct {
 	commitIndex prometheus.Gauge
 	role        prometheus.Gauge // 0=follower, 1=candidate, 2=leader, -1=dead
 	leaderID    prometheus.Gauge
+	// commitStallStepdowns counts self-deposals for lack of commit progress.
+	// A gauge, not a counter, because the reporter polls a cumulative value
+	// that resets when the process does; alert on changes() over a window.
+	commitStallStepdowns prometheus.Gauge
 
 	proposalsTotal prometheus.Counter
 	appliesTotal   prometheus.Counter
@@ -67,6 +71,11 @@ func NewCollector(nodeID uint64) *Collector {
 		Help:        "This node's view of the current leader ID (0 if unknown)",
 		ConstLabels: labels,
 	})
+	c.commitStallStepdowns = factory.NewGauge(prometheus.GaugeOpts{
+		Name:        "kmc_raft_commit_stall_stepdowns",
+		Help:        "Times this node deposed itself for lack of commit progress (cumulative since process start)",
+		ConstLabels: labels,
+	})
 	c.proposalsTotal = factory.NewCounter(prometheus.CounterOpts{
 		Name:        "kmc_raft_proposals_total",
 		Help:        "Proposals accepted by this node while leader",
@@ -106,6 +115,11 @@ func NewCollector(nodeID uint64) *Collector {
 // Handler returns the Prometheus scrape endpoint for this collector.
 func (c *Collector) Handler() http.Handler {
 	return promhttp.HandlerFor(c.reg, promhttp.HandlerOpts{})
+}
+
+// SetCommitStallStepdowns publishes the node's cumulative watchdog count.
+func (c *Collector) SetCommitStallStepdowns(n uint64) {
+	c.commitStallStepdowns.Set(float64(n))
 }
 
 // SetRaft updates gauges from a node's current Raft view.

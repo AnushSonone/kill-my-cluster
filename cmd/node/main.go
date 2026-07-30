@@ -10,6 +10,12 @@
 //	PEERS=2=node2:7000,3=node3:7000          # other Raft peers (id=host:port)
 //	KV_PEERS=1=node1:8000,2=node2:8000,...   # all KV endpoints (for traffic agent)
 //	RUN_AGENT=true                           # only one node should set this
+//	SNAPSHOT_ENTRIES=10000                   # auto-compact every N applies
+//	SNAPSHOT_RETAIN=32768                    # entries kept behind the snapshot;
+//	                                         # must exceed HEAL_AFTER x write rate
+//	RAFT_COMMIT_STALL_TIMEOUT=30s            # leader self-deposes after this
+//	                                         # long with no commit progress
+//	                                         # (negative disables the watchdog)
 package main
 
 import (
@@ -47,6 +53,7 @@ func main() {
 		Transport:       transport,
 		Timings:         cfg.timings,
 		SnapshotEntries: cfg.snapshotEntries,
+		SnapshotRetain:  cfg.snapshotRetain,
 	})
 	if err != nil {
 		fatalf("cluster: %v", err)
@@ -127,6 +134,7 @@ type config struct {
 	runAgent        bool
 	timings         raft.Timings
 	snapshotEntries uint64
+	snapshotRetain  int
 }
 
 func loadConfig() (config, error) {
@@ -162,7 +170,26 @@ func loadConfig() (config, error) {
 		runAgent:        runAgent,
 		timings:         loadTimings(),
 		snapshotEntries: loadSnapshotEntries(),
+		snapshotRetain:  loadSnapshotRetain(),
 	}, nil
+}
+
+// loadSnapshotRetain reads SNAPSHOT_RETAIN (0/unset = raft default of 32768).
+// Retention must exceed HEAL_AFTER x peak write rate or every healed node
+// lands past the tail and forces a full InstallSnapshot — see the
+// SnapshotRetain doc in internal/raft. Negative is passed through: it means
+// "keep nothing", which tests rely on.
+func loadSnapshotRetain() int {
+	v := os.Getenv("SNAPSHOT_RETAIN")
+	if v == "" {
+		return 0
+	}
+	nv, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ignoring SNAPSHOT_RETAIN=%q: %v\n", v, err)
+		return 0
+	}
+	return nv
 }
 
 // loadSnapshotEntries reads SNAPSHOT_ENTRIES (0/unset = kv default of 10000).
@@ -199,11 +226,26 @@ func loadTimings() raft.Timings {
 		}
 		return d
 	}
+	// The commit-stall watchdog is the one clock where a negative value is
+	// meaningful ("disable"), so it cannot use dur, which floors at 0.
+	stall := func(key string) time.Duration {
+		v := os.Getenv(key)
+		if v == "" {
+			return 0
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ignoring %s=%q: %v\n", key, v, err)
+			return 0
+		}
+		return d
+	}
 	return raft.Timings{
 		ElectionTimeoutMin: dur("RAFT_ELECTION_TIMEOUT_MIN"),
 		ElectionTimeoutMax: dur("RAFT_ELECTION_TIMEOUT_MAX"),
 		HeartbeatInterval:  dur("RAFT_HEARTBEAT_INTERVAL"),
 		TickInterval:       dur("RAFT_TICK_INTERVAL"),
+		CommitStallTimeout: stall("RAFT_COMMIT_STALL_TIMEOUT"),
 	}
 }
 
