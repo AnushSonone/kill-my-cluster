@@ -1,0 +1,1 @@
+{"t":"2026-08-01T16:03:32.880398443Z","kind":"controlplane_started","detail":"audit log opened","alive":7,"total":7,"quorum":true,"term":32,"leader":6,"commitIndex":209107838,"writesPerSec":858.8571428571428,"readsPerSec":308.1722285714286,"hostCpuPct":92.93103448277368}
