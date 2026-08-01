@@ -1,1 +1,9 @@
 {"t":"2026-08-01T16:03:32.880398443Z","kind":"controlplane_started","detail":"audit log opened","alive":7,"total":7,"quorum":true,"term":32,"leader":6,"commitIndex":209107838,"writesPerSec":858.8571428571428,"readsPerSec":308.1722285714286,"hostCpuPct":92.93103448277368}
+{"t":"2026-08-01T19:23:31.975909149Z","kind":"kill","detail":"Machine 2 killed","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
+{"t":"2026-08-01T19:23:38.875951701Z","kind":"kill","detail":"Machine 6 killed","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
+{"t":"2026-08-01T19:23:42.189043815Z","kind":"heal","detail":"Node 2 auto-healed (restarted)","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
+{"t":"2026-08-01T19:23:43.083451236Z","kind":"leader_changed","detail":"node 5 replaced node 6 at term 34","alive":6,"total":7,"quorum":true,"term":34,"leader":5,"commitIndex":222253998,"writesPerSec":861.7142857142857,"readsPerSec":73.10402857142857,"hostCpuPct":71.41379310344527}
+{"t":"2026-08-01T19:23:48.970664579Z","kind":"heal","detail":"Node 6 auto-healed (restarted)","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
+{"t":"2026-08-01T19:23:54.788834329Z","kind":"kill","detail":"Machine 5 killed","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
+{"t":"2026-08-01T19:23:57.995915344Z","kind":"leader_changed","detail":"node 7 replaced node 5 at term 35","alive":6,"total":7,"quorum":true,"term":35,"leader":7,"commitIndex":222270216,"writesPerSec":1093.7142857142856,"readsPerSec":83.14144761904763,"hostCpuPct":68.00862068961703}
+{"t":"2026-08-01T19:24:04.918316505Z","kind":"heal","detail":"Node 5 auto-healed (restarted)","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
