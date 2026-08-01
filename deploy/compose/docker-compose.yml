@@ -292,7 +292,16 @@ services:
     logging: *kmc-logging
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Never hardcode this: the repo is public. Compose substitutes from
+      # deploy/compose/.env (gitignored). The :? makes a missing value a hard
+      # startup failure rather than a silent fall back to something guessable.
+      #
+      # This actually rotates the password because there is no volume on
+      # /var/lib/grafana: grafana.db lives in the container layer and is
+      # recreated with the container. On a Grafana with a persistent DB this
+      # env var is ignored after first boot and you would need
+      # `grafana cli admin reset-admin-password` instead.
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:?set GF_ADMIN_PASSWORD in deploy/compose/.env}
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       # Allow embedding from wiki / local UI (host Grafana on :3001).

@@ -13,3 +13,6 @@ coverage*
 
 # OS / editor cruft
 .DS_Store
+
+# Local/box-only secrets for compose (Grafana admin password).
+deploy/compose/.env
