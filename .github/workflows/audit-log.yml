@@ -1,0 +1,126 @@
+# Archive the cluster's audit log off the box, on GitHub's schedule.
+#
+# The audit log (internal/controlplane/audit.go) records why the cluster went
+# bad. It lives on the Oracle VM's disk, so it survives the cluster misbehaving
+# but not the box being lost, which is the 2026-07-21 failure mode. This pulls it
+# somewhere that outlives the VM.
+#
+# Nothing is installed on the VM and nothing runs on a laptop. The audit
+# endpoint is already public through the Cloudflare tunnel, so this only needs
+# an outbound GET and the automatic GITHUB_TOKEN. No deploy key, no stored
+# secret, no inbound access to the box.
+#
+# Commits land on an orphan `audit-log` branch so main's history stays code.
+#   gh api repos/AnushSonone/kill-my-cluster/contents/events.jsonl?ref=audit-log
+#   git fetch origin audit-log && git show origin/audit-log:events.jsonl
+
+name: audit-log
+
+on:
+  schedule:
+    # Every 6h. The endpoint returns at most 1000 entries, and the cluster
+    # produces a handful of transitions a day (about 90 during heavy kill
+    # churn), so this window cannot realistically overflow. Merging is
+    # dedupe-based, so overlapping fetches are harmless.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+# Scheduled workflows are auto-disabled after 60 days without repo activity.
+# This one commits, which counts, so it keeps itself alive.
+concurrency:
+  group: audit-log
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    env:
+      ENDPOINT: https://raft-api.anush.wiki/api/audit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch from the live cluster
+        id: fetch
+        run: |
+          set -uo pipefail
+          if ! curl -sS --max-time 30 -f "${ENDPOINT}?limit=1000" -o /tmp/resp.json; then
+            # The box being unreachable is exactly what this archive guards
+            # against. Yesterday's copy is already committed; nothing to do.
+            echo "cluster unreachable, leaving the archive as it stands"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq -c '.entries[]?' /tmp/resp.json > /tmp/incoming.jsonl || true
+          if [ ! -s /tmp/incoming.jsonl ]; then
+            echo "no entries returned"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "fetched $(wc -l < /tmp/incoming.jsonl) entries"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Merge into the audit-log branch
+        if: steps.fetch.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin audit-log >/dev/null 2>&1; then
+            git fetch -q origin audit-log
+            git checkout -q -B audit-log origin/audit-log
+          else
+            # First run: start a history with no code in it.
+            git checkout -q --orphan audit-log
+            git rm -rq --cached . 2>/dev/null || true
+            find . -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +
+          fi
+
+          touch events.jsonl
+          # Union old and new, drop exact duplicates, order by timestamp. Append
+          # only: a line once written is never rewritten or removed.
+          cat /tmp/incoming.jsonl events.jsonl \
+            | grep -v '^[[:space:]]*$' \
+            | sort -u \
+            | jq -c -s 'sort_by(.t) | .[]' > merged.jsonl
+          mv merged.jsonl events.jsonl
+
+          cat > README.md <<'EOF'
+          # kill-my-cluster audit log
+
+          Append-only incident record for the live demo, archived off the Oracle
+          VM so it survives the box being lost.
+
+          Written by `internal/controlplane/audit.go` on `main`, pulled every 6h
+          by `.github/workflows/audit-log.yml` from the public `/api/audit`
+          endpoint. One JSON object per line, oldest first.
+
+          Kinds: `controlplane_started`, `quorum_lost`, `quorum_regained`,
+          `leader_changed`, `progress_stalled`, `progress_resumed`,
+          `watchdog_stepdown`.
+
+          `progress_stalled` means the commit index froze for 60s while quorum
+          held and a leader was in office. That is the 2026-07-28 signature, and
+          because the raft commit-stall watchdog acts at 30s, a line here means
+          the watchdog did not save it.
+
+          ```bash
+          git show origin/audit-log:events.jsonl | jq 'select(.kind=="progress_stalled")'
+          ```
+          EOF
+
+          if git diff --quiet -- events.jsonl README.md 2>/dev/null && git ls-files --error-unmatch events.jsonl >/dev/null 2>&1; then
+            echo "no new entries"
+            exit 0
+          fi
+          git add events.jsonl README.md
+          if git diff --cached --quiet; then
+            echo "no change to commit"
+            exit 0
+          fi
+          git commit -q -m "audit: $(wc -l < events.jsonl | tr -d ' ') entries through $(tail -1 events.jsonl | jq -r .t)"
+          git push -q origin audit-log
+          echo "pushed"
