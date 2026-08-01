@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +45,7 @@ func NewServer(eng *Engine, opts ServerOptions) *Server {
 	s.mux.HandleFunc("/api/nodes/", s.handleNodeAction)
 	s.mux.HandleFunc("/api/stream", s.handleStream)
 	s.mux.HandleFunc("/api/reset", s.handleReset)
+	s.mux.HandleFunc("/api/audit", s.handleAudit)
 	return s
 }
 
@@ -225,4 +227,43 @@ func ListenAndServe(addr string, eng *Engine, opts ServerOptions) error {
 	}
 	fmt.Printf("control plane listening on http://%s\n", addr)
 	return srv.ListenAndServe()
+}
+
+// handleAudit serves the durable incident log, newest last. This is the record
+// Prometheus cannot keep: its retention is 24h, and the 2026-07-28 wedge was
+// only diagnosed two days later, by which point the window holding the
+// transition had already rolled off.
+//
+// Public by design. It exposes cluster health history and nothing else: no
+// secrets, no credentials, no client data.
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	path := s.engine.AuditPath()
+	if path == "" {
+		http.Error(w, "audit log disabled", http.StatusNotFound)
+		return
+	}
+	lines, err := tailAudit(path, limit)
+	if err != nil {
+		// A log that has not been written to yet is not an error worth 500ing.
+		if os.IsNotExist(err) {
+			writeJSON(w, map[string]any{"entries": []any{}})
+			return
+		}
+		http.Error(w, "audit log unreadable", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"entries": lines})
 }

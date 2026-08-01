@@ -22,6 +22,9 @@ type RateCache struct {
 	writes float64
 	reads  float64
 
+	stepdowns   float64
+	stepdownsOK bool
+
 	hostOK        bool
 	cpuBusyPct    float64
 	memUsedBytes  float64
@@ -75,12 +78,30 @@ func (r *RateCache) Host() (cpuBusyPct, memUsedBytes, memTotalBytes float64, ok 
 	return r.cpuBusyPct, r.memUsedBytes, r.memTotalBytes, r.hostOK
 }
 
+// Stepdowns returns the cluster-wide cumulative count of raft commit-stall
+// watchdog step-downs. ok is false when the metric could not be read.
+func (r *RateCache) Stepdowns() (uint64, bool) {
+	if r == nil {
+		return 0, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if !r.stepdownsOK || r.stepdowns < 0 {
+		return 0, false
+	}
+	return uint64(r.stepdowns), true
+}
+
 func (r *RateCache) refresh(ctx context.Context) {
 	// Leader-only so follower applies do not multiply throughput by N.
 	// Join on instance (scrape target), not node_id: duplicate node_id labels
 	// under kill/restart churn make on(node_id) many-to-many and return 0.
 	w := r.query(ctx, `sum(rate(kmc_kv_writes_total[15s]) and on(instance) (kmc_raft_is_leader == 1))`)
 	rd := r.query(ctx, `sum(rate(kmc_kv_reads_total[15s]) and on(instance) (kmc_raft_is_leader == 1))`)
+
+	// Summed, not maxed: each node reports its own count and any of them
+	// deposing itself is worth a line.
+	step, stepOK := r.queryOK(ctx, `sum(kmc_raft_commit_stall_stepdowns)`)
 
 	cpu, cpuOK := r.queryOK(ctx, `100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[30s])))`)
 	memTotal, memTotalOK := r.queryOK(ctx, `node_memory_MemTotal_bytes`)
@@ -100,6 +121,7 @@ func (r *RateCache) refresh(ctx context.Context) {
 	r.mu.Lock()
 	r.writes = w
 	r.reads = rd
+	r.stepdowns, r.stepdownsOK = step, stepOK
 	r.hostOK = hostOK
 	if hostOK {
 		r.cpuBusyPct = cpu

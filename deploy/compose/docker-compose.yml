@@ -213,6 +213,11 @@ services:
       CORS_ORIGINS: https://anush.wiki,http://127.0.0.1:3000,http://localhost:3000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Host path, NOT a named volume: a named volume is destroyed by
+      # `docker compose down -v`, and an incident record that dies during the
+      # incident is worth very little. Also readable with plain cat, which
+      # matters because this image is distroless.
+      - /var/log/kmc:/audit
     ports:
       - "8080:8080"
     networks: [kmc]

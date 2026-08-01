@@ -42,6 +42,10 @@ func main() {
 		IPCooldown: 2 * time.Second,
 		HealAfter:  healAfter,
 		Rates:      rates,
+		// Durable incident record. Bind-mounted to a host path in compose so it
+		// survives `docker compose down -v`, container removal and image
+		// rebuilds. Set AUDIT_PATH="" to disable.
+		AuditPath: env("AUDIT_PATH", "/audit/events.jsonl"),
 	})
 	if err != nil {
 		fatalf("%v", err)

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -68,6 +69,10 @@ type Engine struct {
 	reconStop chan struct{}
 	reconOnce sync.Once
 
+	// audit is the durable incident record (see audit.go). nil = disabled.
+	audit     *auditLog
+	auditPath string
+
 	// Quorum edge tracking for HUD "time since last quorum loss".
 	quorumMu         sync.Mutex
 	sawQuorum        bool // true after first successful quorum observation
@@ -104,6 +109,10 @@ type Config struct {
 	HealAfter time.Duration
 	// Rates is optional Prometheus-backed write/read QPS.
 	Rates *RateCache
+	// AuditPath is the append-only incident log (see audit.go). Empty disables
+	// it; so does any open failure, which is logged and then ignored. The demo
+	// must still start when its logging cannot.
+	AuditPath string
 }
 
 // NewEngine validates the whitelist. Docker connectivity is checked lazily.
@@ -133,6 +142,13 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if heal <= 0 {
 		heal = 10 * time.Second
 	}
+	al, err := openAuditLog(cfg.AuditPath)
+	if err != nil {
+		// Not fatal on purpose: no audit log is bad, a cluster that refuses to
+		// boot because of one is worse.
+		fmt.Fprintf(os.Stderr, "controlplane: audit log disabled (%s): %v\n", cfg.AuditPath, err)
+		al = nil
+	}
 	return &Engine{
 		dockerBin:  bin,
 		network:    cfg.Network,
@@ -144,7 +160,27 @@ func NewEngine(cfg Config) (*Engine, error) {
 		healAfter:  heal,
 		heals:      make(map[uint64]*healJob),
 		eventCap:   64,
+		audit:      al,
+		auditPath:  cfg.AuditPath,
 	}, nil
+}
+
+// AuditPath is where the incident log is written ("" when disabled).
+func (e *Engine) AuditPath() string { return e.auditPath }
+
+// auditOnce samples the cluster and records any state change. Runs on the
+// reconcile tick; on a healthy tick it writes nothing.
+func (e *Engine) auditOnce(ctx context.Context) {
+	if e.audit == nil {
+		return
+	}
+	snap := e.Snapshot(ctx) // cached 500ms, so this is nearly free
+	var stepdowns uint64
+	var ok bool
+	if e.rates != nil {
+		stepdowns, ok = e.rates.Stepdowns()
+	}
+	e.audit.observe(snap, stepdowns, ok, time.Now())
 }
 
 // AddViewer increments the live SSE presence count.
@@ -171,6 +207,7 @@ func (e *Engine) activeUsers() int {
 
 // Close stops the reconciler and cancels pending heal timers.
 func (e *Engine) Close() error {
+	defer func() { _ = e.audit.Close() }()
 	e.reconOnce.Do(func() {
 		if e.reconStop != nil {
 			close(e.reconStop)
@@ -208,6 +245,7 @@ func (e *Engine) StartReconciler(interval time.Duration) {
 				return
 			case <-t.C:
 				e.reconcileOnce()
+				e.auditOnce(context.Background())
 			}
 		}
 	}()
@@ -533,6 +571,12 @@ func (e *Engine) addEvent(kind, message string) {
 	e.eventMu.Lock()
 	defer e.eventMu.Unlock()
 	ev := Event{Time: time.Now(), Kind: kind, Message: message}
+	// Mirror to the durable log. The RAM ring below is for the UI feed and dies
+	// with the process; kills and heals are exactly the context that made the
+	// 2026-07-28 timeline reconstructible, so they belong on disk too.
+	if e.audit != nil {
+		e.audit.write(AuditEntry{Time: ev.Time.UTC(), Kind: kind, Detail: message})
+	}
 	if len(e.events) < e.eventCap {
 		e.events = append(e.events, ev)
 		return
