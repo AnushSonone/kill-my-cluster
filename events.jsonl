@@ -8,3 +8,4 @@
 {"t":"2026-08-01T19:23:57.995915344Z","kind":"leader_changed","detail":"node 7 replaced node 5 at term 35","alive":6,"total":7,"quorum":true,"term":35,"leader":7,"commitIndex":222270216,"writesPerSec":1093.7142857142856,"readsPerSec":83.14144761904763,"hostCpuPct":68.00862068961703}
 {"t":"2026-08-01T19:24:04.918316505Z","kind":"heal","detail":"Node 5 auto-healed (restarted)","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
 {"t":"2026-08-02T05:50:52.8883257Z","kind":"leader_changed","detail":"node 2 replaced node 7 at term 37","alive":7,"total":7,"quorum":true,"term":37,"leader":2,"commitIndex":259501237,"writesPerSec":0,"readsPerSec":0,"hostCpuPct":71.65517241378909}
+{"t":"2026-08-02T13:48:13.082289681Z","kind":"leader_changed","detail":"node 4 replaced node 2 at term 40","alive":7,"total":7,"quorum":true,"term":40,"leader":4,"commitIndex":285522372,"writesPerSec":728.3571428571428,"readsPerSec":199.42518095238094,"hostCpuPct":69.71551724135021}
