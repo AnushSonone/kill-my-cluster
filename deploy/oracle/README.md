@@ -1,6 +1,8 @@
 # Oracle host notes
 
-VM is already provisioned (Ampere A1 recommended). This repo does not create the instance.
+VM is already provisioned. Always Free hard cap (as of 2026-08-10 docs):
+**A1 Flex 2 OCPU / 12 GB total** across the tenancy. The live demo box is sized
+to that. This repo does not create the instance.
 
 ## Bring up the cluster
 

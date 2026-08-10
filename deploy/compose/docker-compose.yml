@@ -186,8 +186,8 @@ services:
     logging: *kmc-logging
     environment:
       KV_PEERS: 1=node1:8000,2=node2:8000,3=node3:8000,4=node4:8000,5=node5:8000,6=node6:8000,7=node7:8000
-      # Aligned to Oracle ladder ceiling (2026-07-21): ~1400w/3000r sustained
-      # on A1 Flex 4 OCPU with term flat. Local may exceed; cloud is the claim.
+      # Local default. Oracle Always Free (2 OCPU / 12 GB) overrides these in
+      # docker-compose.oracle.yml (2026-08-10 ladder: ~782w/863r at 900/1400).
       WRITE_QPS: "1400"
       READ_QPS: "3000"
       WRITE_WORKERS: "64"

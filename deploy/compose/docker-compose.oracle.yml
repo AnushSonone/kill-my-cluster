@@ -4,30 +4,70 @@
 # Public: control plane :8080, Grafana :3001
 # Private: Prometheus (no host port)
 # UI: anush.wiki/blog/raft (local Svelte web service disabled)
+#
+# Tuned 2026-08-10 for Always Free A1 Flex 2 OCPU / 12 GB (was 4/24).
+# Soft-cap sum ~1.75 so sshd/cloudflared/steal keep ~0.25. Local Mac keeps
+# the higher base caps in docker-compose.yml.
 
 services:
   web:
     profiles: ["local-ui"]
 
-  # Re-balanced 2026-07-28 for the post-incident CPU caps (nodes 0.45 each):
-  # 128 read workers saturated the capped leader and starved the write path
-  # to ~25w/s (write p50 hit 2.5s+ with zero errors). Measured with this mix:
-  # ~640w/s + ~850r/s sustained, term flat, no errors. The old uncapped
-  # ladder peak (~1413w/3233r, 2026-07-21) is not reachable under caps;
-  # re-ladder if the headline number matters.
-  loadgen:
+  # Nodes: 7 x 0.18 = 1.26. GOMAXPROCS 1 matches the tighter CPU share.
+  node1:
+    cpus: 0.18
     environment:
-      WRITE_QPS: "1400"
-      READ_QPS: "2000"
-      WRITE_WORKERS: "64"
-      READ_WORKERS: "32"
+      GOMAXPROCS: "1"
+  node2:
+    cpus: 0.18
+    environment:
+      GOMAXPROCS: "1"
+  node3:
+    cpus: 0.18
+    environment:
+      GOMAXPROCS: "1"
+  node4:
+    cpus: 0.18
+    environment:
+      GOMAXPROCS: "1"
+  node5:
+    cpus: 0.18
+    environment:
+      GOMAXPROCS: "1"
+  node6:
+    cpus: 0.18
+    environment:
+      GOMAXPROCS: "1"
+  node7:
+    cpus: 0.18
+    environment:
+      GOMAXPROCS: "1"
+
+  # Re-laddered 2026-08-10 on Always Free 2 OCPU / 12 GB. Peak sustained under
+  # term-flat + zero commit-stall: ~787w/876r at 900/1400 with 48w/24r. Higher
+  # targets (1000/1600) thrashed the capped loadgen and cut delivered QPS.
+  loadgen:
+    cpus: 0.20
+    environment:
+      WRITE_QPS: "900"
+      READ_QPS: "1400"
+      WRITE_WORKERS: "48"
+      READ_WORKERS: "24"
+
+  controlplane:
+    cpus: 0.08
 
   prometheus:
+    cpus: 0.08
     ports: !override []
 
   grafana:
+    cpus: 0.08
     environment:
       GF_SERVER_ROOT_URL: https://raft-grafana.anush.wiki
       GF_SECURITY_ALLOW_EMBEDDING: "true"
       GF_SECURITY_COOKIE_SAMESITE: disabled
       GF_SECURITY_X_FRAME_OPTIONS: ""
+
+  node-exporter:
+    cpus: 0.05
