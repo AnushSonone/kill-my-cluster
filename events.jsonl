@@ -32,3 +32,4 @@
 {"t":"2026-08-07T00:15:40.690355507Z","kind":"heal","detail":"Node 4 auto-healed (restarted)","alive":0,"total":0,"quorum":false,"writesPerSec":0,"readsPerSec":0}
 {"t":"2026-08-07T00:39:52.49330261Z","kind":"quorum_lost","detail":"1 of 7 alive","alive":1,"total":7,"quorum":false,"term":48,"leader":5,"commitIndex":661228997,"writesPerSec":1156,"readsPerSec":1500.7142857142856,"hostCpuPct":75.49999999996388}
 {"t":"2026-08-07T00:39:58.380335998Z","kind":"quorum_regained","alive":7,"total":7,"quorum":true,"term":48,"leader":5,"commitIndex":661236235,"writesPerSec":1161.642857142857,"readsPerSec":1506.7142857142856,"hostCpuPct":75.17241379311348}
+{"t":"2026-08-10T20:22:07.9636302Z","kind":"controlplane_started","detail":"audit log opened","alive":7,"total":7,"quorum":true,"term":49,"leader":3,"commitIndex":1044441944,"writesPerSec":0,"readsPerSec":0}
