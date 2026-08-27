@@ -8,7 +8,9 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AnushSonone/kill-my-cluster/internal/kvpb"
@@ -18,12 +20,32 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// peerPenalty is how long a peer that just failed an RPC is tried last.
+//
+// A stopped container's endpoint is simply gone: no RST, so an RPC to it
+// blocks for the caller's whole deadline and comes back DeadlineExceeded,
+// which gRPC does not treat as a broken connection. Before this, every
+// request re-walked the peers from scratch and re-paid that hang on every
+// dead peer ahead of the leader (2026-08-26: one killed follower stalled all
+// loadgen workers ~5s and cost ~40% of throughput). Two seconds is long
+// enough to skip a corpse and short enough that a healed node is retried
+// well within its 10s heal window.
+const peerPenalty = 2 * time.Second
+
 // Client talks to a multi-node KV cluster over gRPC.
 type Client struct {
 	mu    sync.Mutex
 	addrs map[uint64]string
 	conns map[uint64]*grpc.ClientConn
-	order []uint64
+	order []uint64 // ascending node ID, so the walk is deterministic
+	// badUntil demotes peers whose last RPC failed (see peerPenalty).
+	badUntil map[uint64]time.Time
+
+	// leader is the last node that answered as leader, tried first on every
+	// request. 0 = unknown. Wrong guesses cost one NotLeader round trip and
+	// fix themselves from the hint; a dead leader costs one deadline and is
+	// then demoted like any other failed peer.
+	leader atomic.Uint64
 }
 
 // NewClient dials lazily; addrs maps node ID → "host:port" for the KV API.
@@ -32,10 +54,12 @@ func NewClient(addrs map[uint64]string) *Client {
 	for id := range addrs {
 		order = append(order, id)
 	}
+	slices.Sort(order)
 	return &Client{
-		addrs: addrs,
-		conns: make(map[uint64]*grpc.ClientConn),
-		order: order,
+		addrs:    addrs,
+		conns:    make(map[uint64]*grpc.ClientConn),
+		order:    order,
+		badUntil: make(map[uint64]time.Time),
 	}
 }
 
@@ -113,13 +137,20 @@ func (c *Client) ExecuteOnce(ctx context.Context, clientID string, requestID uin
 
 func (c *Client) viaLeader(ctx context.Context, fn func(kvpb.KVClient) (notLeader bool, leaderHint uint64, err error)) error {
 	deadline := time.Now().Add(8 * time.Second)
-	prefer := uint64(0)
+	prefer := c.leader.Load()
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		ids := c.tryOrder(prefer)
 		for _, id := range ids {
+			// Only start an attempt on a live context, so a failure below is
+			// this peer's own doing. Once a dead peer has eaten the deadline,
+			// every later peer would fail instantly and be demoted unfairly,
+			// the leader included.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			stub, err := c.stub(id)
 			if err != nil {
 				continue
@@ -133,6 +164,7 @@ func (c *Client) viaLeader(ctx context.Context, fn func(kvpb.KVClient) (notLeade
 				if status.Code(err) == codes.Unavailable {
 					c.invalidate(id)
 				}
+				c.demote(id)
 				continue
 			}
 			if notLeader {
@@ -141,6 +173,7 @@ func (c *Client) viaLeader(ctx context.Context, fn func(kvpb.KVClient) (notLeade
 				}
 				continue
 			}
+			c.leader.Store(id)
 			return nil
 		}
 		// A full sweep found no leader: the cluster is mid-election. Back off
@@ -157,17 +190,42 @@ func (c *Client) viaLeader(ctx context.Context, fn func(kvpb.KVClient) (notLeade
 	return fmt.Errorf("kv: no leader available")
 }
 
+// tryOrder is: the preferred (last known leader or hinted) peer, then the
+// rest ascending, with peers inside their penalty window moved to the end.
 func (c *Client) tryOrder(prefer uint64) []uint64 {
-	if prefer == 0 {
-		return append([]uint64(nil), c.order...)
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]uint64, 0, len(c.order))
+	var bad []uint64
+	if prefer != 0 {
+		if now.Before(c.badUntil[prefer]) {
+			bad = append(bad, prefer)
+		} else {
+			out = append(out, prefer)
+		}
 	}
-	out := []uint64{prefer}
 	for _, id := range c.order {
-		if id != prefer {
+		if id == prefer {
+			continue
+		}
+		if now.Before(c.badUntil[id]) {
+			bad = append(bad, id)
+		} else {
 			out = append(out, id)
 		}
 	}
-	return out
+	return append(out, bad...)
+}
+
+// demote pushes a peer that just failed to the back of the walk for
+// peerPenalty. It also forgets it as leader, so the next request walks
+// instead of paying the same deadline on the same corpse.
+func (c *Client) demote(id uint64) {
+	c.mu.Lock()
+	c.badUntil[id] = time.Now().Add(peerPenalty)
+	c.mu.Unlock()
+	c.leader.CompareAndSwap(id, 0)
 }
 
 func (c *Client) invalidate(id uint64) {
