@@ -44,7 +44,7 @@ func TestScheduleHealCancel(t *testing.T) {
 		heals:     make(map[uint64]*healJob),
 		eventCap:  8,
 	}
-	e.scheduleHeal(1, "start")
+	e.scheduleHeal(1, "start", true)
 	e.healMu.Lock()
 	_, ok := e.heals[1]
 	e.healMu.Unlock()

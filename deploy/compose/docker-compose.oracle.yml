@@ -54,8 +54,13 @@ services:
       WRITE_WORKERS: "48"
       READ_WORKERS: "24"
 
+  # Chaos monkey on: the public demo shows a kill and recovery about once a
+  # minute even with nobody clicking. One node at a time, never during an
+  # outage, never within 30s of a visitor kill.
   controlplane:
     cpus: 0.08
+    environment:
+      CHAOS_INTERVAL: 60s
 
   prometheus:
     cpus: 0.08

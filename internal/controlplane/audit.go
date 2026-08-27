@@ -57,6 +57,12 @@ type AuditEntry struct {
 	WritesPerSec float64   `json:"writesPerSec"`
 	ReadsPerSec  float64   `json:"readsPerSec"`
 	HostCPUPct   *float64  `json:"hostCpuPct,omitempty"`
+	// ChaosNode/ChaosAgeMs say whether the chaos monkey acted shortly before
+	// this transition (within chaosAuditContext). Monkey kills are not logged
+	// individually, so this is how a leader_changed or progress_stalled line
+	// stays self-explanatory.
+	ChaosNode  uint64 `json:"chaosNode,omitempty"`
+	ChaosAgeMs int64  `json:"chaosAgeMs,omitempty"`
 }
 
 // auditLog appends transitions to disk and remembers just enough previous state
@@ -166,7 +172,7 @@ func (a *auditLog) rotateLocked() {
 // entryFrom flattens a Snapshot into a log line. maxCommit is the highest commit
 // index any node reports, which is the cluster's real progress marker.
 func entryFrom(kind, detail string, snap Snapshot, maxCommit uint64) AuditEntry {
-	return AuditEntry{
+	e := AuditEntry{
 		Time:         time.Now().UTC(),
 		Kind:         kind,
 		Detail:       detail,
@@ -180,6 +186,11 @@ func entryFrom(kind, detail string, snap Snapshot, maxCommit uint64) AuditEntry 
 		ReadsPerSec:  snap.ReadsPerSec,
 		HostCPUPct:   snap.HostCpuBusyPct,
 	}
+	if c := snap.Chaos; c != nil && c.Node != 0 && c.AgeMs >= 0 && c.AgeMs <= chaosAuditContext.Milliseconds() {
+		e.ChaosNode = c.Node
+		e.ChaosAgeMs = c.AgeMs
+	}
+	return e
 }
 
 // maxCommitIndex is the furthest any node has committed. Taking the max, not the

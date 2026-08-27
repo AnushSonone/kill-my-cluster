@@ -211,6 +211,10 @@ services:
       PROMETHEUS_URL: http://prometheus:9090
       ALLOW_RESET: "false"
       CORS_ORIGINS: https://anush.wiki,http://127.0.0.1:3000,http://localhost:3000
+      # Chaos monkey: kill one random healthy node every interval (+/-25%),
+      # only when 7/7 are up with a leader and progress, yielding 30s after any
+      # visitor kill. Off locally; the Oracle overlay turns it on at 60s.
+      CHAOS_INTERVAL: ${CHAOS_INTERVAL:-0}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Host path, NOT a named volume: a named volume is destroyed by

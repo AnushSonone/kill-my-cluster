@@ -73,6 +73,15 @@ type Engine struct {
 	audit     *auditLog
 	auditPath string
 
+	// Chaos monkey (see chaos.go). chaosStop ends the loop; chaosMu guards
+	// the rest. lastVisitorKill is what the monkey yields to.
+	chaosStop       chan struct{}
+	chaosStopOnce   sync.Once
+	chaosMu         sync.Mutex
+	chaosInterval   time.Duration
+	lastChaos       chaosKill
+	lastVisitorKill time.Time
+
 	// Quorum edge tracking for HUD "time since last quorum loss".
 	quorumMu         sync.Mutex
 	sawQuorum        bool // true after first successful quorum observation
@@ -85,6 +94,9 @@ type healJob struct {
 	due    time.Time
 	timer  *time.Timer
 	cancel chan struct{}
+	// audit mirrors the heal line to the durable log. False for chaos-monkey
+	// kills, which would otherwise write ~1,400 heal lines a day.
+	audit bool
 }
 
 // Event is a short feed line for the UI.
@@ -213,6 +225,11 @@ func (e *Engine) Close() error {
 			close(e.reconStop)
 		}
 	})
+	e.chaosStopOnce.Do(func() {
+		if e.chaosStop != nil {
+			close(e.chaosStop)
+		}
+	})
 	e.healMu.Lock()
 	defer e.healMu.Unlock()
 	for id, job := range e.heals {
@@ -339,7 +356,9 @@ type Snapshot struct {
 	HostCpuBusyPct    *float64 `json:"hostCpuBusyPct,omitempty"`
 	HostMemUsedBytes  *float64 `json:"hostMemUsedBytes,omitempty"`
 	HostMemTotalBytes *float64 `json:"hostMemTotalBytes,omitempty"`
-	Events            []Event  `json:"events"`
+	// Chaos is the chaos monkey's state; nil when CHAOS_INTERVAL is unset.
+	Chaos  *ChaosInfo `json:"chaos,omitempty"`
+	Events []Event    `json:"events"`
 }
 
 // Snapshot returns the current cluster view, cached for 500ms so N SSE
@@ -410,6 +429,7 @@ func (e *Engine) buildSnapshot(ctx context.Context) Snapshot {
 		HostCpuBusyPct:        hostCPU,
 		HostMemUsedBytes:      hostMemUsed,
 		HostMemTotalBytes:     hostMemTotal,
+		Chaos:                 e.chaosInfo(time.Now()),
 		Events:                e.Events(),
 	}
 }
@@ -469,19 +489,8 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if err := e.allowDisrupt(ctx, clientIP); err != nil {
 			return err
 		}
-		e.cancelHeal(id)
-		// Register the heal BEFORE stopping: the reconcile loop treats a
-		// pending heal as "this outage is intentional" — scheduling first
-		// means there is never a moment where a freshly killed container
-		// looks like an accident and gets insta-restarted.
-		e.scheduleHeal(id, "start")
-		// -t 1 ≈ abrupt crash (Raft's intended failure mode).
-		if err := e.run(ctx, "stop", "-t", "1", n.ContainerName); err != nil {
-			e.cancelHeal(id)
-			return err
-		}
-		e.addEvent("kill", fmt.Sprintf("Machine %d killed", id))
-		return nil
+		e.noteVisitorKill()
+		return e.kill(ctx, id, killSourceVisitor)
 
 	case ActionRestart:
 		e.cancelHeal(id)
@@ -507,6 +516,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		if err := e.allowDisrupt(ctx, clientIP); err != nil {
 			return err
 		}
+		e.noteVisitorKill()
 		e.cancelHeal(id)
 		st, err := e.inspect(ctx, n)
 		if err != nil {
@@ -519,7 +529,7 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 			return fmt.Errorf("controlplane: machine %d already partitioned", id)
 		}
 		// Heal first for the same reconciler reason as ActionKill.
-		e.scheduleHeal(id, "reconnect")
+		e.scheduleHeal(id, "reconnect", true)
 		if err := e.run(ctx, "network", "disconnect", e.network, n.ContainerName); err != nil {
 			e.cancelHeal(id)
 			return err
@@ -530,6 +540,35 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 	default:
 		return fmt.Errorf("controlplane: unknown action %q", action)
 	}
+}
+
+// kill stops a whitelisted machine abruptly and schedules its heal. Shared by
+// the visitor path (Do, after the per-IP cooldown) and the chaos monkey, which
+// skips the cooldown so it can never rate-limit a real visitor or vice versa.
+func (e *Engine) kill(ctx context.Context, id uint64, src killSource) error {
+	n, ok := e.nodes[id]
+	if !ok {
+		return fmt.Errorf("controlplane: node %d not in whitelist", id)
+	}
+	e.cancelHeal(id)
+	// Register the heal BEFORE stopping: the reconcile loop treats a
+	// pending heal as "this outage is intentional" — scheduling first
+	// means there is never a moment where a freshly killed container
+	// looks like an accident and gets insta-restarted.
+	e.scheduleHeal(id, "start", src == killSourceVisitor)
+	// -t 1 ≈ abrupt crash (Raft's intended failure mode).
+	if err := e.run(ctx, "stop", "-t", "1", n.ContainerName); err != nil {
+		e.cancelHeal(id)
+		return err
+	}
+	if src == killSourceChaos {
+		// Ring only. The audit log gets chaos context stamped onto the edge
+		// lines it already writes (entryFrom), not a line per monkey kill.
+		e.addRingEvent("chaos", fmt.Sprintf("Machine %d killed by the chaos monkey", id))
+	} else {
+		e.addEvent("kill", fmt.Sprintf("Machine %d killed", id))
+	}
+	return nil
 }
 
 // ResetAll brings every whitelisted node back (start + reconnect). Not rate-limited.
@@ -567,22 +606,31 @@ func (e *Engine) Events() []Event {
 	return out
 }
 
+// addEvent appends a feed line and mirrors it to the durable log. The RAM ring
+// is for the UI and dies with the process; visitor kills and heals are exactly
+// the context that made the 2026-07-28 timeline reconstructible, so they belong
+// on disk too.
 func (e *Engine) addEvent(kind, message string) {
-	e.eventMu.Lock()
-	defer e.eventMu.Unlock()
-	ev := Event{Time: time.Now(), Kind: kind, Message: message}
-	// Mirror to the durable log. The RAM ring below is for the UI feed and dies
-	// with the process; kills and heals are exactly the context that made the
-	// 2026-07-28 timeline reconstructible, so they belong on disk too.
+	ev := e.addRingEvent(kind, message)
 	if e.audit != nil {
 		e.audit.write(AuditEntry{Time: ev.Time.UTC(), Kind: kind, Detail: message})
 	}
+}
+
+// addRingEvent appends a feed line to the UI ring only. Used for chaos-monkey
+// activity, which is routine by design and must not bury real incidents in
+// the audit log.
+func (e *Engine) addRingEvent(kind, message string) Event {
+	e.eventMu.Lock()
+	defer e.eventMu.Unlock()
+	ev := Event{Time: time.Now(), Kind: kind, Message: message}
 	if len(e.events) < e.eventCap {
 		e.events = append(e.events, ev)
-		return
+		return ev
 	}
 	copy(e.events, e.events[1:])
 	e.events[len(e.events)-1] = ev
+	return ev
 }
 
 func (e *Engine) attachHeal(st *Status) {
@@ -632,7 +680,7 @@ func (e *Engine) attachRaft(ctx context.Context, st *Status) {
 	st.Role = body.Role
 }
 
-func (e *Engine) scheduleHeal(id uint64, kind string) {
+func (e *Engine) scheduleHeal(id uint64, kind string, audit bool) {
 	e.healMu.Lock()
 	defer e.healMu.Unlock()
 	if old, ok := e.heals[id]; ok {
@@ -640,7 +688,7 @@ func (e *Engine) scheduleHeal(id uint64, kind string) {
 	}
 	due := time.Now().Add(e.healAfter)
 	cancel := make(chan struct{})
-	job := &healJob{kind: kind, due: due, cancel: cancel}
+	job := &healJob{kind: kind, due: due, cancel: cancel, audit: audit}
 	job.timer = time.AfterFunc(e.healAfter, func() {
 		select {
 		case <-cancel:
@@ -649,7 +697,7 @@ func (e *Engine) scheduleHeal(id uint64, kind string) {
 		}
 		ctx, c := context.WithTimeout(context.Background(), 30*time.Second)
 		defer c()
-		e.runHeal(ctx, id, kind)
+		e.runHeal(ctx, id, kind, audit)
 		e.healMu.Lock()
 		delete(e.heals, id)
 		e.healMu.Unlock()
@@ -657,10 +705,19 @@ func (e *Engine) scheduleHeal(id uint64, kind string) {
 	e.heals[id] = job
 }
 
-func (e *Engine) runHeal(ctx context.Context, id uint64, kind string) {
+func (e *Engine) runHeal(ctx context.Context, id uint64, kind string, audit bool) {
 	n, ok := e.nodes[id]
 	if !ok {
 		return
+	}
+	// A failed heal is always audited: the node stays down and the reconciler
+	// takes over, which is worth a line whoever asked for the kill.
+	emit := func(msg string) {
+		if audit {
+			e.addEvent("heal", msg)
+		} else {
+			e.addRingEvent("heal", msg)
+		}
 	}
 	switch kind {
 	case "start":
@@ -675,13 +732,13 @@ func (e *Engine) runHeal(ctx context.Context, id uint64, kind string) {
 		if e.network != "" {
 			_ = e.connectNetwork(ctx, n.ContainerName)
 		}
-		e.addEvent("heal", fmt.Sprintf("Node %d auto-healed (restarted)", id))
+		emit(fmt.Sprintf("Node %d auto-healed (restarted)", id))
 	case "reconnect":
 		if err := e.connectNetwork(ctx, n.ContainerName); err != nil {
 			e.addEvent("heal", fmt.Sprintf("Node %d heal reconnect failed: %v", id, err))
 			return
 		}
-		e.addEvent("heal", fmt.Sprintf("Node %d auto-healed (rejoined network)", id))
+		emit(fmt.Sprintf("Node %d auto-healed (rejoined network)", id))
 	}
 }
 

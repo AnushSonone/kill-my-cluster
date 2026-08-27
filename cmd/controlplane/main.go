@@ -7,6 +7,7 @@
 //	PROMETHEUS_URL=http://prometheus:9090
 //	ALLOW_RESET=false
 //	CORS_ORIGINS=https://anush.wiki,http://127.0.0.1:3000
+//	CHAOS_INTERVAL=0            (60s on Oracle: kill one random node per minute, 0 = off)
 package main
 
 import (
@@ -28,6 +29,12 @@ func main() {
 	healAfter, err := time.ParseDuration(env("HEAL_AFTER", "10s"))
 	if err != nil {
 		fatalf("HEAL_AFTER: %v", err)
+	}
+	// Chaos monkey: the demo should be demonstrating even with no visitors.
+	// 0 disables. See internal/controlplane/chaos.go for the guards.
+	chaosInterval, err := time.ParseDuration(env("CHAOS_INTERVAL", "0"))
+	if err != nil {
+		fatalf("CHAOS_INTERVAL: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -54,11 +61,12 @@ func main() {
 	// Self-healing beyond CP-initiated kills: crashed containers and
 	// CP-restart-orphaned outages come back within one reconcile tick.
 	eng.StartReconciler(5 * time.Second)
+	eng.StartChaos(chaosInterval)
 
 	addr := env("HTTP_ADDR", "0.0.0.0:8080")
 	allowReset := strings.EqualFold(env("ALLOW_RESET", "false"), "true")
-	fmt.Printf("whitelist: %d nodes · network=%s · heal=%s · reset=%v\n",
-		len(nodes), env("CONTROL_NETWORK", "kmc_kmc"), healAfter, allowReset)
+	fmt.Printf("whitelist: %d nodes · network=%s · heal=%s · reset=%v · chaos=%s\n",
+		len(nodes), env("CONTROL_NETWORK", "kmc_kmc"), healAfter, allowReset, chaosInterval)
 	if err := controlplane.ListenAndServe(addr, eng, controlplane.ServerOptions{
 		AllowReset:  allowReset,
 		CORSOrigins: env("CORS_ORIGINS", ""),

@@ -49,6 +49,7 @@ flowchart LR
 | Per-IP kill cooldown | **2s** (same computer / IP) |
 | Public reset | **off** |
 | Recover delay | internal only (not advertised on the wiki) |
+| Chaos monkey | `CHAOS_INTERVAL` (Oracle **60s** +/-25%, local off): one random healthy node, only when 7/7 up with a leader and progress, yields 30s after a visitor kill |
 
 Leaders should flip when a visitor kills a machine, not under idle load.
 

@@ -34,6 +34,7 @@ talk to the Oracle public IP.
 | Per-IP kill cooldown | 2s | Same computer cannot spam kills |
 | Silent recover | internal delay | UI does not advertise the timer |
 | Reset | disabled publicly | Avoid wipe / grief |
+| Chaos monkey | 60s +/-25%, one node, only when 7/7 healthy, yields 30s to visitors | Demo keeps demonstrating with no visitors; never stacks on an outage |
 
 ### Architecture diagram
 
