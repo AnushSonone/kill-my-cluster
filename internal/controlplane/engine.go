@@ -388,56 +388,70 @@ type Snapshot struct {
 }
 
 const (
-	// snapshotMaxAge is how old a served view may be before a rebuild starts.
+	// snapshotMaxAge is how old a view may be and still count as fresh.
 	snapshotMaxAge = 500 * time.Millisecond
-	// snapshotBuildTimeout bounds a background rebuild, which must not borrow
-	// the context of whichever request happened to trigger it.
+	// snapshotStaleLimit is how old a view may be and still be served while a
+	// rebuild runs in the background. Past it, or once an action has
+	// invalidated the view, callers wait for the rebuild: a lone request after
+	// an idle minute, or the next frame after a kill, must see the change.
+	snapshotStaleLimit = 2 * time.Second
+	// snapshotBuildTimeout bounds one build. A build is shared by every caller
+	// waiting on it, so it never runs on any one caller's context.
 	snapshotBuildTimeout = 10 * time.Second
 )
 
-// Snapshot returns the current cluster view without waiting on a build.
+// Snapshot returns the current cluster view.
 //
-// It serves the last build immediately. If that build is older than 500ms it
-// also starts one background rebuild, and never more than one, so any number
-// of viewers cost at most one build per 500ms and none of them waits for it.
-// Only the very first call, before any build exists, blocks.
+// A view under 500ms old is served as is. A view under 2s old is served too,
+// and one background rebuild starts, never more than one, so a steady stream
+// of viewers costs at most one build per 500ms and none of them waits.
+// Anything older, or a view invalidated by an action, waits for a build that
+// every waiting caller shares.
 //
-// The cache this replaced held its lock across the build. When a build took
+// The cache this replaced held its lock across every build. When a build took
 // seconds on the 0.08-CPU Oracle cap, every SSE tick, API call, audit tick and
 // chaos tick queued behind it.
-func (e *Engine) Snapshot(ctx context.Context) Snapshot {
-	snap, _ := e.snapshot(ctx)
+func (e *Engine) Snapshot(_ context.Context) Snapshot {
+	snap, _ := e.snapshot()
 	return snap
 }
 
 // SnapshotJSON is Snapshot already encoded, shared by every viewer. Nil only
 // if the view could not be encoded.
-func (e *Engine) SnapshotJSON(ctx context.Context) []byte {
-	_, data := e.snapshot(ctx)
+func (e *Engine) SnapshotJSON(_ context.Context) []byte {
+	_, data := e.snapshot()
 	return data
 }
 
 // SnapshotFresh returns a view no older than 500ms, building one if needed.
 // For decisions that must not act on stale state, such as the chaos
 // monkey's "everyone is healthy" guard.
-func (e *Engine) SnapshotFresh(ctx context.Context) Snapshot {
-	snap, _ := e.refresh(ctx)
+func (e *Engine) SnapshotFresh(_ context.Context) Snapshot {
+	snap, _ := e.refresh()
 	return snap
 }
 
-func (e *Engine) snapshot(ctx context.Context) (Snapshot, []byte) {
+func (e *Engine) snapshot() (Snapshot, []byte) {
 	e.snapMu.Lock()
-	if !e.snapHave {
-		e.snapMu.Unlock()
-		return e.refresh(ctx)
-	}
-	snap, data := e.snapCached, e.snapJSON
-	if time.Since(e.snapAt) >= snapshotMaxAge && !e.refreshing {
-		e.refreshing = true
-		go e.refreshInBackground()
+	if e.snapHave {
+		age := time.Since(e.snapAt) // snapAt is zero once invalidated
+		if age < snapshotMaxAge {
+			snap, data := e.snapCached, e.snapJSON
+			e.snapMu.Unlock()
+			return snap, data
+		}
+		if age < snapshotStaleLimit {
+			if !e.refreshing {
+				e.refreshing = true
+				go e.refreshInBackground()
+			}
+			snap, data := e.snapCached, e.snapJSON
+			e.snapMu.Unlock()
+			return snap, data
+		}
 	}
 	e.snapMu.Unlock()
-	return snap, data
+	return e.refresh()
 }
 
 func (e *Engine) refreshInBackground() {
@@ -446,14 +460,12 @@ func (e *Engine) refreshInBackground() {
 		e.refreshing = false
 		e.snapMu.Unlock()
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), snapshotBuildTimeout)
-	defer cancel()
-	e.refresh(ctx)
+	e.refresh()
 }
 
 // refresh builds a new view unless a fresh one appeared while it waited for
-// the build lock. Builds never overlap.
-func (e *Engine) refresh(ctx context.Context) (Snapshot, []byte) {
+// the build lock, so callers that pile up behind one build share its result.
+func (e *Engine) refresh() (Snapshot, []byte) {
 	e.buildMu.Lock()
 	defer e.buildMu.Unlock()
 
@@ -470,7 +482,9 @@ func (e *Engine) refresh(ctx context.Context) (Snapshot, []byte) {
 	if build == nil {
 		build = e.buildSnapshot
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotBuildTimeout)
 	snap := build(ctx)
+	cancel()
 	data, err := json.Marshal(snap)
 	if err != nil {
 		data = nil
@@ -481,8 +495,8 @@ func (e *Engine) refresh(ctx context.Context) (Snapshot, []byte) {
 	if e.snapGen == gen {
 		e.snapAt = time.Now()
 	} else {
-		// Something changed the cluster mid-build; serve this view but
-		// rebuild on the next tick.
+		// Something changed the cluster mid-build. Hand this view to the
+		// callers already waiting, but make the next one wait for a rebuild.
 		e.snapAt = time.Time{}
 	}
 	e.snapMu.Unlock()
@@ -490,7 +504,7 @@ func (e *Engine) refresh(ctx context.Context) (Snapshot, []byte) {
 }
 
 // invalidateSnapshot marks the cached view stale after an action changed the
-// cluster, so the next viewer tick starts a rebuild instead of waiting 500ms.
+// cluster, so the next caller waits for a view that includes the change.
 func (e *Engine) invalidateSnapshot() {
 	e.snapMu.Lock()
 	e.snapGen++
