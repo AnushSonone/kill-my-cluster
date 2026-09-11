@@ -91,7 +91,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, s.engine.Snapshot(r.Context()))
+	data := s.engine.SnapshotJSON(r.Context())
+	if data == nil {
+		http.Error(w, "snapshot unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -119,9 +125,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			data, err := json.Marshal(s.engine.Snapshot(ctx))
-			if err != nil {
-				return
+			// Every viewer gets the same pre-encoded bytes; see Engine.Snapshot.
+			data := s.engine.SnapshotJSON(ctx)
+			if data == nil {
+				continue
 			}
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()

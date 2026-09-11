@@ -2,6 +2,7 @@
 //
 //	CONTROL_NODES=1=kmc-node-1,2=kmc-node-2,...
 //	CONTROL_NETWORK=kmc_kmc
+//	DOCKER_SOCKET=/var/run/docker.sock
 //	HEAL_AFTER=10s
 //	HTTP_ADDR=0.0.0.0:8080
 //	PROMETHEUS_URL=http://prometheus:9090
@@ -44,11 +45,12 @@ func main() {
 	go rates.Run(ctx)
 
 	eng, err := controlplane.NewEngine(controlplane.Config{
-		Nodes:      nodes,
-		Network:    env("CONTROL_NETWORK", "kmc_kmc"),
-		IPCooldown: 2 * time.Second,
-		HealAfter:  healAfter,
-		Rates:      rates,
+		Nodes:        nodes,
+		Network:      env("CONTROL_NETWORK", "kmc_kmc"),
+		DockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"),
+		IPCooldown:   2 * time.Second,
+		HealAfter:    healAfter,
+		Rates:        rates,
 		// Durable incident record. Bind-mounted to a host path in compose so it
 		// survives `docker compose down -v`, container removal and image
 		// rebuilds. Set AUDIT_PATH="" to disable.

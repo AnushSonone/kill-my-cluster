@@ -95,7 +95,7 @@ func chaosWait(interval time.Duration, u float64) time.Duration {
 // chaosOnce takes one look at the cluster and kills one node if every guard
 // passes. Any miss is silent: the next tick will look again.
 func (e *Engine) chaosOnce(ctx context.Context) {
-	snap := e.Snapshot(ctx)
+	snap := e.SnapshotFresh(ctx) // never kill on a stale view of who is healthy
 	e.chaosMu.Lock()
 	lastVisitor := e.lastVisitorKill
 	e.chaosMu.Unlock()

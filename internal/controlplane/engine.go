@@ -3,17 +3,16 @@ package controlplane
 // Package controlplane is the safe kill switch for the demo cluster.
 //
 // It can ONLY operate on a whitelist of Docker containers mapped from node
-// IDs. Commands are fixed argv arrays (never a shell). Rate limits + auto-heal
-// keep a crowd from permanently destroying quorum.
+// IDs. Docker is driven through fixed Engine API calls on the mounted socket
+// (never a shell). Rate limits + auto-heal keep a crowd from permanently
+// destroying quorum.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -34,9 +33,9 @@ type Node struct {
 	ContainerName string
 }
 
-// Engine runs docker CLI against the mounted daemon socket.
+// Engine drives Docker through the Engine API on the mounted daemon socket.
 type Engine struct {
-	dockerBin string
+	docker    *dockerAPI
 	network   string // compose network name for partition (e.g. kmc_kmc)
 	nodes     map[uint64]Node
 	startedAt time.Time
@@ -58,12 +57,23 @@ type Engine struct {
 	viewersMu sync.Mutex
 	viewers   int
 
-	// Snapshot cache: building a Snapshot shells out to docker inspect 1-2x
-	// per node plus an HTTP probe per node. Uncached, every SSE viewer paid
-	// that cost twice a second — O(viewers) process spawns on a small VM.
+	// Snapshot cache (see Snapshot). snapMu guards the cached view and is
+	// never held across a build; buildMu keeps builds from overlapping.
 	snapMu     sync.Mutex
 	snapCached Snapshot
-	snapAt     time.Time
+	snapJSON   []byte    // snapCached encoded once, shared by every viewer
+	snapAt     time.Time // zero means stale
+	snapHave   bool
+	snapGen    uint64 // bumped by invalidateSnapshot
+	refreshing bool   // a background rebuild is in flight
+	buildMu    sync.Mutex
+	// buildFn replaces buildSnapshot in tests.
+	buildFn func(context.Context) Snapshot
+
+	// probe is the shared keep-alive client for node health probes.
+	probe *http.Client
+	// probeURL replaces the node health endpoint in tests.
+	probeURL func(id uint64) string
 
 	// reconStop ends the reconcile loop (see StartReconciler).
 	reconStop chan struct{}
@@ -110,7 +120,9 @@ type Event struct {
 type Config struct {
 	Nodes []Node
 
-	DockerBin string
+	// DockerSocket is the Docker Engine API unix socket. Default
+	// /var/run/docker.sock, which compose mounts into the container.
+	DockerSocket string
 	// Network is the Docker network used for partition (disconnect/connect).
 	Network string
 
@@ -131,10 +143,6 @@ type Config struct {
 func NewEngine(cfg Config) (*Engine, error) {
 	if len(cfg.Nodes) == 0 {
 		return nil, fmt.Errorf("controlplane: need at least one whitelisted node")
-	}
-	bin := cfg.DockerBin
-	if bin == "" {
-		bin = "docker"
 	}
 	nodes := make(map[uint64]Node, len(cfg.Nodes))
 	for _, n := range cfg.Nodes {
@@ -162,7 +170,8 @@ func NewEngine(cfg Config) (*Engine, error) {
 		al = nil
 	}
 	return &Engine{
-		dockerBin:  bin,
+		docker:     newDockerAPI(cfg.DockerSocket),
+		probe:      newProbeClient(),
 		network:    cfg.Network,
 		nodes:      nodes,
 		startedAt:  time.Now().UTC(),
@@ -186,7 +195,7 @@ func (e *Engine) auditOnce(ctx context.Context) {
 	if e.audit == nil {
 		return
 	}
-	snap := e.Snapshot(ctx) // cached 500ms, so this is nearly free
+	snap := e.Snapshot(ctx) // served from cache; a transition lands at most one build late
 	var stepdowns uint64
 	var ok bool
 	if e.rates != nil {
@@ -271,27 +280,44 @@ func (e *Engine) StartReconciler(interval time.Duration) {
 func (e *Engine) reconcileOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// One list call covers the healthy case, which is almost every tick.
+	states, err := e.docker.containers(ctx)
+	if err != nil {
+		return // docker unavailable; try next tick
+	}
 	for _, n := range e.Nodes() {
 		if e.healPending(n.ID) {
 			continue // intentional outage; the heal timer owns it
 		}
+		cs, ok := states[n.ContainerName]
+		if !ok {
+			continue // container unknown; try next tick
+		}
+		if st := e.statusFrom(n, cs); st.Running && !st.Partitioned {
+			continue
+		}
+		// The list can be seconds old by the time the loop gets here (a start
+		// takes about a second, and a heal may have fired meanwhile), so look
+		// again before acting on a node that seems wrong.
 		st, err := e.inspect(ctx, n)
-		if err != nil {
-			continue // docker unavailable or container unknown; try next tick
+		if err != nil || e.healPending(n.ID) {
+			continue
 		}
 		if !st.Running {
-			if err := e.run(ctx, "start", n.ContainerName); err != nil {
+			if err := e.docker.start(ctx, n.ContainerName); err != nil {
 				e.addEvent("heal", fmt.Sprintf("Node %d reconcile start failed: %v", n.ID, err))
 				continue
 			}
 			if e.network != "" {
 				_ = e.connectNetwork(ctx, n.ContainerName)
 			}
+			e.invalidateSnapshot()
 			e.addEvent("heal", fmt.Sprintf("Node %d reconciled (was down outside any heal window)", n.ID))
 			continue
 		}
 		if st.Partitioned {
 			if err := e.connectNetwork(ctx, n.ContainerName); err == nil {
+				e.invalidateSnapshot()
 				e.addEvent("heal", fmt.Sprintf("Node %d reconciled (rejoined network)", n.ID))
 			}
 		}
@@ -361,18 +387,115 @@ type Snapshot struct {
 	Events []Event    `json:"events"`
 }
 
-// Snapshot returns the current cluster view, cached for 500ms so N SSE
-// viewers cost one build per tick instead of N.
+const (
+	// snapshotMaxAge is how old a served view may be before a rebuild starts.
+	snapshotMaxAge = 500 * time.Millisecond
+	// snapshotBuildTimeout bounds a background rebuild, which must not borrow
+	// the context of whichever request happened to trigger it.
+	snapshotBuildTimeout = 10 * time.Second
+)
+
+// Snapshot returns the current cluster view without waiting on a build.
+//
+// It serves the last build immediately. If that build is older than 500ms it
+// also starts one background rebuild, and never more than one, so any number
+// of viewers cost at most one build per 500ms and none of them waits for it.
+// Only the very first call, before any build exists, blocks.
+//
+// The cache this replaced held its lock across the build. When a build took
+// seconds on the 0.08-CPU Oracle cap, every SSE tick, API call, audit tick and
+// chaos tick queued behind it.
 func (e *Engine) Snapshot(ctx context.Context) Snapshot {
-	e.snapMu.Lock()
-	defer e.snapMu.Unlock()
-	if time.Since(e.snapAt) < 500*time.Millisecond {
-		return e.snapCached
-	}
-	snap := e.buildSnapshot(ctx)
-	e.snapCached = snap
-	e.snapAt = time.Now()
+	snap, _ := e.snapshot(ctx)
 	return snap
+}
+
+// SnapshotJSON is Snapshot already encoded, shared by every viewer. Nil only
+// if the view could not be encoded.
+func (e *Engine) SnapshotJSON(ctx context.Context) []byte {
+	_, data := e.snapshot(ctx)
+	return data
+}
+
+// SnapshotFresh returns a view no older than 500ms, building one if needed.
+// For decisions that must not act on stale state, such as the chaos
+// monkey's "everyone is healthy" guard.
+func (e *Engine) SnapshotFresh(ctx context.Context) Snapshot {
+	snap, _ := e.refresh(ctx)
+	return snap
+}
+
+func (e *Engine) snapshot(ctx context.Context) (Snapshot, []byte) {
+	e.snapMu.Lock()
+	if !e.snapHave {
+		e.snapMu.Unlock()
+		return e.refresh(ctx)
+	}
+	snap, data := e.snapCached, e.snapJSON
+	if time.Since(e.snapAt) >= snapshotMaxAge && !e.refreshing {
+		e.refreshing = true
+		go e.refreshInBackground()
+	}
+	e.snapMu.Unlock()
+	return snap, data
+}
+
+func (e *Engine) refreshInBackground() {
+	defer func() {
+		e.snapMu.Lock()
+		e.refreshing = false
+		e.snapMu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotBuildTimeout)
+	defer cancel()
+	e.refresh(ctx)
+}
+
+// refresh builds a new view unless a fresh one appeared while it waited for
+// the build lock. Builds never overlap.
+func (e *Engine) refresh(ctx context.Context) (Snapshot, []byte) {
+	e.buildMu.Lock()
+	defer e.buildMu.Unlock()
+
+	e.snapMu.Lock()
+	if e.snapHave && time.Since(e.snapAt) < snapshotMaxAge {
+		snap, data := e.snapCached, e.snapJSON
+		e.snapMu.Unlock()
+		return snap, data
+	}
+	gen := e.snapGen
+	e.snapMu.Unlock()
+
+	build := e.buildFn
+	if build == nil {
+		build = e.buildSnapshot
+	}
+	snap := build(ctx)
+	data, err := json.Marshal(snap)
+	if err != nil {
+		data = nil
+	}
+
+	e.snapMu.Lock()
+	e.snapCached, e.snapJSON, e.snapHave = snap, data, true
+	if e.snapGen == gen {
+		e.snapAt = time.Now()
+	} else {
+		// Something changed the cluster mid-build; serve this view but
+		// rebuild on the next tick.
+		e.snapAt = time.Time{}
+	}
+	e.snapMu.Unlock()
+	return snap, data
+}
+
+// invalidateSnapshot marks the cached view stale after an action changed the
+// cluster, so the next viewer tick starts a rebuild instead of waiting 500ms.
+func (e *Engine) invalidateSnapshot() {
+	e.snapMu.Lock()
+	e.snapGen++
+	e.snapAt = time.Time{}
+	e.snapMu.Unlock()
 }
 
 // buildSnapshot assembles the cluster view from live Docker + Raft state.
@@ -457,24 +580,33 @@ func (e *Engine) noteQuorum(quorum bool) int64 {
 	return now.Sub(e.lastQuorumLossAt).Milliseconds()
 }
 
-// List reports running/exited for every whitelisted machine.
+// List reports running/exited for every whitelisted machine: one Docker list
+// call, then every reachable node's health probe at once.
 func (e *Engine) List(ctx context.Context) ([]Status, error) {
 	nodes := e.Nodes()
-	out := make([]Status, 0, len(nodes))
-	for _, n := range nodes {
-		st, err := e.inspect(ctx, n)
-		if err != nil {
-			st = Status{
+	out := make([]Status, len(nodes))
+	states, err := e.docker.containers(ctx)
+	var wg sync.WaitGroup
+	for i, n := range nodes {
+		cs, ok := states[n.ContainerName]
+		if err != nil || !ok {
+			out[i] = Status{
 				ID: n.ID, ContainerName: n.ContainerName,
 				Running: false, Status: "unknown",
 			}
+		} else {
+			out[i] = e.statusFrom(n, cs)
 		}
-		e.attachHeal(&st)
-		if st.Running && !st.Partitioned {
-			e.attachRaft(ctx, &st)
+		e.attachHeal(&out[i])
+		if out[i].Running && !out[i].Partitioned {
+			wg.Add(1)
+			go func(st *Status) {
+				defer wg.Done()
+				e.attachRaft(ctx, st)
+			}(&out[i])
 		}
-		out = append(out, st)
 	}
+	wg.Wait()
 	return out, nil
 }
 
@@ -499,13 +631,14 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 			return err
 		}
 		if !st.Running {
-			if err := e.run(ctx, "start", n.ContainerName); err != nil {
+			if err := e.docker.start(ctx, n.ContainerName); err != nil {
 				return err
 			}
 		}
 		if st.Partitioned || e.network != "" {
 			_ = e.connectNetwork(ctx, n.ContainerName) // best-effort
 		}
+		e.invalidateSnapshot()
 		e.addEvent("restart", fmt.Sprintf("Machine %d restarted", id))
 		return nil
 
@@ -530,10 +663,11 @@ func (e *Engine) Do(ctx context.Context, clientIP string, id uint64, action Acti
 		}
 		// Heal first for the same reconciler reason as ActionKill.
 		e.scheduleHeal(id, "reconnect", true)
-		if err := e.run(ctx, "network", "disconnect", e.network, n.ContainerName); err != nil {
+		if err := e.docker.networkDisconnect(ctx, e.network, n.ContainerName); err != nil {
 			e.cancelHeal(id)
 			return err
 		}
+		e.invalidateSnapshot()
 		e.addEvent("partition", fmt.Sprintf("Machine %d partitioned", id))
 		return nil
 
@@ -557,10 +691,11 @@ func (e *Engine) kill(ctx context.Context, id uint64, src killSource) error {
 	// looks like an accident and gets insta-restarted.
 	e.scheduleHeal(id, "start", src == killSourceVisitor)
 	// -t 1 ≈ abrupt crash (Raft's intended failure mode).
-	if err := e.run(ctx, "stop", "-t", "1", n.ContainerName); err != nil {
+	if err := e.docker.stop(ctx, n.ContainerName, 1); err != nil {
 		e.cancelHeal(id)
 		return err
 	}
+	e.invalidateSnapshot()
 	if src == killSourceChaos {
 		// Ring only. The audit log gets chaos context stamped onto the edge
 		// lines it already writes (entryFrom), not a line per monkey kill.
@@ -582,7 +717,7 @@ func (e *Engine) ResetAll(ctx context.Context) error {
 			continue
 		}
 		if !st.Running {
-			if err := e.run(ctx, "start", n.ContainerName); err != nil {
+			if err := e.docker.start(ctx, n.ContainerName); err != nil {
 				errs = append(errs, err.Error())
 			}
 		}
@@ -590,6 +725,7 @@ func (e *Engine) ResetAll(ctx context.Context) error {
 			_ = e.connectNetwork(ctx, n.ContainerName)
 		}
 	}
+	e.invalidateSnapshot()
 	e.addEvent("reset", "Reset all: every node started and rejoined the network")
 	if len(errs) > 0 {
 		return fmt.Errorf("controlplane: reset partial failures: %s", strings.Join(errs, "; "))
@@ -650,11 +786,17 @@ func (e *Engine) attachHeal(st *Status) {
 // (compose service nodeN:9100). Best-effort — Docker state still drives kill UX.
 func (e *Engine) attachRaft(ctx context.Context, st *Status) {
 	url := fmt.Sprintf("http://node%d:9100/healthz", st.ID)
+	if e.probeURL != nil {
+		url = e.probeURL(st.ID)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return
 	}
-	client := &http.Client{Timeout: 250 * time.Millisecond}
+	client := e.probe
+	if client == nil {
+		client = fallbackProbe
+	}
 	res, err := client.Do(req)
 	if err != nil {
 		return
@@ -725,19 +867,21 @@ func (e *Engine) runHeal(ctx context.Context, id uint64, kind string, audit bool
 		if err == nil && st.Running {
 			return
 		}
-		if err := e.run(ctx, "start", n.ContainerName); err != nil {
+		if err := e.docker.start(ctx, n.ContainerName); err != nil {
 			e.addEvent("heal", fmt.Sprintf("Node %d heal start failed: %v", id, err))
 			return
 		}
 		if e.network != "" {
 			_ = e.connectNetwork(ctx, n.ContainerName)
 		}
+		e.invalidateSnapshot()
 		emit(fmt.Sprintf("Node %d auto-healed (restarted)", id))
 	case "reconnect":
 		if err := e.connectNetwork(ctx, n.ContainerName); err != nil {
 			e.addEvent("heal", fmt.Sprintf("Node %d heal reconnect failed: %v", id, err))
 			return
 		}
+		e.invalidateSnapshot()
 		emit(fmt.Sprintf("Node %d auto-healed (rejoined network)", id))
 	}
 }
@@ -767,7 +911,7 @@ func (e *Engine) connectNetwork(ctx context.Context, container string) error {
 		return nil
 	}
 	// Idempotent: ignore "already connected" style errors.
-	err := e.run(ctx, "network", "connect", e.network, container)
+	err := e.docker.networkConnect(ctx, e.network, container)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "already") {
 		return nil
 	}
@@ -775,57 +919,48 @@ func (e *Engine) connectNetwork(ctx context.Context, container string) error {
 }
 
 func (e *Engine) inspect(ctx context.Context, n Node) (Status, error) {
-	out, err := e.output(ctx, "inspect", "-f", "{{.State.Running}} {{.State.Status}}", n.ContainerName)
+	cs, err := e.docker.inspect(ctx, n.ContainerName)
 	if err != nil {
 		return Status{}, err
 	}
-	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) < 2 {
-		return Status{}, fmt.Errorf("controlplane: bad inspect output %q", out)
-	}
+	return e.statusFrom(n, cs), nil
+}
+
+// statusFrom turns Docker's view of a container into a machine Status. A
+// running machine that is off the cluster network is partitioned.
+func (e *Engine) statusFrom(n Node, cs containerState) Status {
 	st := Status{
 		ID:            n.ID,
 		ContainerName: n.ContainerName,
-		Running:       fields[0] == "true",
-		Status:        fields[1],
+		Running:       cs.Running,
+		Status:        cs.Status,
 	}
 	if e.network != "" && st.Running {
-		nets, err := e.output(ctx, "inspect", "-f", "{{json .NetworkSettings.Networks}}", n.ContainerName)
-		if err == nil {
-			st.Partitioned = !strings.Contains(nets, `"`+e.network+`"`)
+		st.Partitioned = true
+		for _, net := range cs.Networks {
+			if net == e.network {
+				st.Partitioned = false
+				break
+			}
 		}
 	}
-	return st, nil
+	return st
 }
 
-func (e *Engine) run(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, e.dockerBin, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("controlplane: docker %v: %s", args, msg)
+// newProbeClient is shared by every health probe so connections to the seven
+// nodes are reused instead of dialled afresh each build.
+func newProbeClient() *http.Client {
+	return &http.Client{
+		Timeout: 250 * time.Millisecond,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+		},
 	}
-	return nil
 }
 
-func (e *Engine) output(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, e.dockerBin, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return "", fmt.Errorf("controlplane: docker %v: %s", args, msg)
-	}
-	return stdout.String(), nil
-}
+// fallbackProbe serves Engines built without NewEngine (tests).
+var fallbackProbe = newProbeClient()
 
 func (e *Engine) allowDisrupt(_ context.Context, clientIP string) error {
 	now := time.Now()
